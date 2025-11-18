@@ -346,6 +346,66 @@ static u16 auth_shared_key(struct hostapd_data *hapd, struct sta_info *sta,
 #endif /* CONFIG_WEP */
 
 
+void flip_random_bit(uint8_t *buf, size_t len)
+{
+    if (len == 0) return;
+
+    size_t i = rand() % len;      // random byte
+    int bit  = rand() % 8;        // random bit
+
+	uint8_t before = buf[i];
+    buf[i] ^= (1 << bit);         // flip the bit
+	wpa_printf(MSG_INFO, "pos=%d before=%02x after=%02x", (int)i, before, buf[i]);
+}
+
+static void dump_auth_mgmt(const struct ieee80211_mgmt *mgmt, size_t len)
+{
+	u16 fc = le_to_host16(mgmt->frame_control);
+	struct ieee802_11_elems elems;
+	const u8 *ies;
+	size_t ies_len;
+
+	wpa_printf(MSG_INFO, "=== AUTH MGMT ===");
+	wpa_printf(MSG_INFO, "FC=0x%04x %s", fc, fc2str(fc));
+	wpa_printf(MSG_INFO, " DA=" MACSTR " SA=" MACSTR " BSSID=" MACSTR,
+			MAC2STR(mgmt->da),
+			MAC2STR(mgmt->sa),
+			MAC2STR(mgmt->bssid));
+
+	wpa_printf(MSG_INFO, " auth_alg=%u auth_transaction=%u status=%u",
+				le_to_host16(mgmt->u.auth.auth_alg),
+				le_to_host16(mgmt->u.auth.auth_transaction),
+				le_to_host16(mgmt->u.auth.status_code));
+
+	/* locate IEs */
+	ies = mgmt->u.auth.variable;
+	if ((const u8 *) mgmt + len <= ies) {
+		wpa_printf(MSG_INFO, "no IEs\n");
+		wpa_printf(MSG_INFO, "===\n");
+		return;
+	}
+
+	ies_len = (const u8 *) mgmt + len - ies;
+
+	if (ieee802_11_parse_elems(ies, ies_len, &elems, 1) != ParseOK) {
+		wpa_printf(MSG_INFO, " IE parse failed");
+		wpa_hexdump_ascii(MSG_INFO, " IEs (raw)", ies, ies_len);
+		wpa_printf(MSG_INFO, "===\n");
+		return;
+	}
+
+	if (elems.ssid)
+		wpa_hexdump_ascii(MSG_INFO, " SSID", elems.ssid, elems.ssid_len);
+	if (elems.rsn_ie)
+		wpa_hexdump_ascii(MSG_INFO, " RSN IE", elems.rsn_ie, elems.rsn_ie_len);
+	if (elems.ext_capab)
+		wpa_hexdump_ascii(MSG_INFO, " Ext Capab",
+					elems.ext_capab, elems.ext_capab_len);
+
+	wpa_printf(MSG_INFO, "===\n");
+	/* …add whatever fields you care about… */
+}
+
 static int send_auth_reply(struct hostapd_data *hapd, struct sta_info *sta,
 			   const u8 *dst,
 			   u16 auth_alg, u16 auth_transaction, u16 resp,
@@ -396,6 +456,14 @@ static int send_auth_reply(struct hostapd_data *hapd, struct sta_info *sta,
 
 	wpabuf_free(ml_resp);
 #endif /* CONFIG_IEEE80211BE */
+
+	if (rand() / RAND_MAX < 0.2) {
+		wpa_printf(MSG_INFO, "Flipping");
+		flip_random_bit((uint8_t *)reply, rlen);
+	} else {
+		wpa_printf(MSG_INFO, "Not flipping");
+	}
+	dump_auth_mgmt(reply, rlen);
 
 	wpa_printf(MSG_DEBUG, "authentication reply: STA=" MACSTR
 		   " auth_alg=%d auth_transaction=%d resp=%d (IE len=%lu) (dbg=%s)",
