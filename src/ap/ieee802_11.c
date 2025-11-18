@@ -457,7 +457,9 @@ static int send_auth_reply(struct hostapd_data *hapd, struct sta_info *sta,
 	wpabuf_free(ml_resp);
 #endif /* CONFIG_IEEE80211BE */
 
-	if (rand() / RAND_MAX < 0.2) {
+	float chance = rand() / (float)RAND_MAX;
+	// wpa_printf(MSG_INFO, "chance=%f", chance);
+	if (chance < 0.2) {
 		wpa_printf(MSG_INFO, "Flipping");
 		flip_random_bit((uint8_t *)reply, rlen);
 	} else {
