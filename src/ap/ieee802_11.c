@@ -90,8 +90,6 @@ static void pasn_fils_auth_resp(struct hostapd_data *hapd,
 #endif /* CONFIG_FILS */
 #endif /* CONFIG_PASN */
 
-static int64_t case_id = -10;
-
 static void handle_auth(struct hostapd_data *hapd,
 			const struct ieee80211_mgmt *mgmt, size_t len,
 			int rssi, int from_queue);
@@ -348,54 +346,6 @@ static u16 auth_shared_key(struct hostapd_data *hapd, struct sta_info *sta,
 #endif /* CONFIG_NO_RC4 */
 #endif /* CONFIG_WEP */
 
-static void dump_auth_mgmt(const struct ieee80211_mgmt *mgmt, size_t len)
-{
-	u16 fc = le_to_host16(mgmt->frame_control);
-	struct ieee802_11_elems elems;
-	const u8 *ies;
-	size_t ies_len;
-
-	wpa_printf(MSG_INFO, "=== AUTH MGMT ===");
-	wpa_printf(MSG_INFO, "FC=0x%04x %s", fc, fc2str(fc));
-	wpa_printf(MSG_INFO, " DA=" MACSTR " SA=" MACSTR " BSSID=" MACSTR,
-			MAC2STR(mgmt->da),
-			MAC2STR(mgmt->sa),
-			MAC2STR(mgmt->bssid));
-
-	wpa_printf(MSG_INFO, " auth_alg=%u auth_transaction=%u status=%u",
-				le_to_host16(mgmt->u.auth.auth_alg),
-				le_to_host16(mgmt->u.auth.auth_transaction),
-				le_to_host16(mgmt->u.auth.status_code));
-
-	/* locate IEs */
-	ies = mgmt->u.auth.variable;
-	if ((const u8 *) mgmt + len <= ies) {
-		wpa_printf(MSG_INFO, "no IEs\n");
-		wpa_printf(MSG_INFO, "===\n");
-		return;
-	}
-
-	ies_len = (const u8 *) mgmt + len - ies;
-
-	if (ieee802_11_parse_elems(ies, ies_len, &elems, 1) != ParseOK) {
-		wpa_printf(MSG_INFO, " IE parse failed");
-		wpa_hexdump_ascii(MSG_INFO, " IEs (raw)", ies, ies_len);
-		wpa_printf(MSG_INFO, "===\n");
-		return;
-	}
-
-	if (elems.ssid)
-		wpa_hexdump_ascii(MSG_INFO, " SSID", elems.ssid, elems.ssid_len);
-	if (elems.rsn_ie)
-		wpa_hexdump_ascii(MSG_INFO, " RSN IE", elems.rsn_ie, elems.rsn_ie_len);
-	if (elems.ext_capab)
-		wpa_hexdump_ascii(MSG_INFO, " Ext Capab",
-					elems.ext_capab, elems.ext_capab_len);
-
-	wpa_printf(MSG_INFO, "===\n");
-	/* …add whatever fields you care about… */
-}
-
 static int send_auth_reply(struct hostapd_data *hapd, struct sta_info *sta,
 			   const u8 *dst,
 			   u16 auth_alg, u16 auth_transaction, u16 resp,
@@ -483,15 +433,7 @@ static int send_auth_reply(struct hostapd_data *hapd, struct sta_info *sta,
 #endif /* CONFIG_SAE */
 #endif /* CONFIG_TESTING_OPTIONS */
 
-	size_t non_fuzzed_header_size = 
-		sizeof(reply->frame_control) + 
-		sizeof(reply->duration) + 
-		sizeof(reply->da) + 
-		sizeof(reply->sa);
-	uint8_t *relevant_reply = (uint8_t *)reply + non_fuzzed_header_size;
-	case_id ++;
-	apply_mutation(relevant_reply, non_fuzzed_header_size, case_id);
-	dump_auth_mgmt(reply, rlen);
+	apply_mutation(reply, rlen);
 
 	if (hostapd_drv_send_mlme(hapd, reply, rlen, 0, NULL, 0, 0) < 0)
 		wpa_printf(MSG_INFO, "send_auth_reply: send failed");
@@ -5269,14 +5211,7 @@ static void send_deauth(struct hostapd_data *hapd, const u8 *addr,
 	send_len = IEEE80211_HDRLEN + sizeof(reply.u.deauth);
 	reply.u.deauth.reason_code = host_to_le16(reason_code);
 
-	size_t non_fuzzed_header_size = 
-		sizeof(reply.frame_control) + 
-		sizeof(reply.duration) + 
-		sizeof(reply.da) + 
-		sizeof(reply.sa);
-	uint8_t *relevant_reply = ((uint8_t *)&reply) + non_fuzzed_header_size;
-	case_id ++;
-	apply_mutation(relevant_reply, non_fuzzed_header_size, case_id);
+	apply_mutation(&reply, send_len);
 
 	if (hostapd_drv_send_mlme(hapd, &reply, send_len, 0, NULL, 0, 0) < 0)
 		wpa_printf(MSG_INFO, "Failed to send deauth: %s",
@@ -5780,14 +5715,7 @@ rsnxe_done:
 	}
 #endif /* CONFIG_FILS */
 
-	size_t non_fuzzed_header_size = 
-		sizeof(reply->frame_control) + 
-		sizeof(reply->duration) + 
-		sizeof(reply->da) + 
-		sizeof(reply->sa);
-	uint8_t *relevant_reply = (uint8_t *)reply + non_fuzzed_header_size;
-	case_id ++;
-	apply_mutation(relevant_reply, non_fuzzed_header_size, case_id);
+	apply_mutation(reply, send_len);
 
 	if (hostapd_drv_send_mlme(hapd, reply, send_len, 0, NULL, 0, 0) < 0) {
 		wpa_printf(MSG_INFO, "Failed to send assoc resp: %s",
