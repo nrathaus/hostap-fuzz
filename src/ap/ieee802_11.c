@@ -487,8 +487,8 @@ static int send_auth_reply(struct hostapd_data *hapd, struct sta_info *sta,
 	size_t non_fuzzed_header_size = 
 		sizeof(reply->frame_control) + 
 		sizeof(reply->duration) + 
-		sizeof(reply->da) * 6 + 
-		sizeof(reply->sa) * 6;
+		sizeof(reply->da) + 
+		sizeof(reply->sa);
 	uint8_t *relevant_reply = (uint8_t *)reply + non_fuzzed_header_size;
 	case_id ++;
 	apply_mutation(relevant_reply, non_fuzzed_header_size, case_id);
@@ -5274,9 +5274,9 @@ static void send_deauth(struct hostapd_data *hapd, const u8 *addr,
 	size_t non_fuzzed_header_size = 
 		sizeof(reply.frame_control) + 
 		sizeof(reply.duration) + 
-		sizeof(reply.da) * 6 + 
-		sizeof(reply.sa) * 6;
-	uint8_t *relevant_reply = (uint8_t *)&reply + non_fuzzed_header_size;
+		sizeof(reply.da) + 
+		sizeof(reply.sa);
+	uint8_t *relevant_reply = ((uint8_t *)&reply) + non_fuzzed_header_size;
 	case_id ++;
 	apply_mutation(relevant_reply, non_fuzzed_header_size, case_id);
 
@@ -5786,8 +5786,8 @@ rsnxe_done:
 	size_t non_fuzzed_header_size = 
 		sizeof(reply->frame_control) + 
 		sizeof(reply->duration) + 
-		sizeof(reply->da) * 6 + 
-		sizeof(reply->sa) * 6;
+		sizeof(reply->da) + 
+		sizeof(reply->sa);
 	uint8_t *relevant_reply = (uint8_t *)reply + non_fuzzed_header_size;
 	case_id ++;
 	apply_mutation(relevant_reply, non_fuzzed_header_size, case_id);
