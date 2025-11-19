@@ -17,8 +17,12 @@ static const size_t NUM_INTERESTING = sizeof(interesting_values) / sizeof(intere
 
 #define NUM_MUT_KINDS 3
 
-void apply_mutation(uint8_t *buf, size_t len, uint64_t case_id)
+void apply_mutation(uint8_t *buf, size_t len, int64_t case_id)
 {
+	wpa_printf(MSG_INFO, "case_id: %ld", case_id);
+
+	if (case_id < 0)
+		return;
 	if (len == 0)
 		return;
 
@@ -57,7 +61,7 @@ void apply_mutation(uint8_t *buf, size_t len, uint64_t case_id)
 	case MUT_BYTE_XOR:
 	{
 		uint8_t mask = (uint8_t)(param & 0xFF);
-		wpa_printf(MSG_INFO, "MUT_BYTE_XOR idx=%ld b=%02x", idx, *b);
+		wpa_printf(MSG_INFO, "MUT_BYTE_XOR idx=%ld param=%02x b=%02x", idx, mask, *b);
 
 		*b ^= mask;
 

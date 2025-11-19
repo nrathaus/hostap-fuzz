@@ -90,7 +90,7 @@ static void pasn_fils_auth_resp(struct hostapd_data *hapd,
 #endif /* CONFIG_FILS */
 #endif /* CONFIG_PASN */
 
-static uint64_t case_id = 0;
+static int64_t case_id = -10;
 
 static void handle_auth(struct hostapd_data *hapd,
 			const struct ieee80211_mgmt *mgmt, size_t len,
@@ -483,7 +483,6 @@ static int send_auth_reply(struct hostapd_data *hapd, struct sta_info *sta,
 #endif /* CONFIG_SAE */
 #endif /* CONFIG_TESTING_OPTIONS */
 
-	wpa_printf(MSG_INFO, "Flipping auth reply");
 	size_t non_fuzzed_header_size = 
 		sizeof(reply->frame_control) + 
 		sizeof(reply->duration) + 
@@ -5270,7 +5269,6 @@ static void send_deauth(struct hostapd_data *hapd, const u8 *addr,
 	send_len = IEEE80211_HDRLEN + sizeof(reply.u.deauth);
 	reply.u.deauth.reason_code = host_to_le16(reason_code);
 
-	wpa_printf(MSG_INFO, "Flipping deauth");
 	size_t non_fuzzed_header_size = 
 		sizeof(reply.frame_control) + 
 		sizeof(reply.duration) + 
@@ -5782,7 +5780,6 @@ rsnxe_done:
 	}
 #endif /* CONFIG_FILS */
 
-	wpa_printf(MSG_INFO, "Flipping assoc resp");
 	size_t non_fuzzed_header_size = 
 		sizeof(reply->frame_control) + 
 		sizeof(reply->duration) + 
