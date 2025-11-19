@@ -17,6 +17,7 @@
 #include "crypto/sha384.h"
 #include "crypto/sha512.h"
 #include "crypto/random.h"
+#include "common/fuzz.h"
 #include "common/ieee802_11_defs.h"
 #include "common/ieee802_11_common.h"
 #include "common/wpa_ctrl.h"
@@ -88,6 +89,8 @@ static void pasn_fils_auth_resp(struct hostapd_data *hapd,
 
 #endif /* CONFIG_FILS */
 #endif /* CONFIG_PASN */
+
+static uint64_t case_id = 0;
 
 static void handle_auth(struct hostapd_data *hapd,
 			const struct ieee80211_mgmt *mgmt, size_t len,
@@ -345,19 +348,6 @@ static u16 auth_shared_key(struct hostapd_data *hapd, struct sta_info *sta,
 #endif /* CONFIG_NO_RC4 */
 #endif /* CONFIG_WEP */
 
-
-void flip_random_bit(uint8_t *buf, size_t len)
-{
-    if (len == 0) return;
-
-    size_t i = rand() % len;      // random byte
-    int bit  = rand() % 8;        // random bit
-
-	uint8_t before = buf[i];
-    buf[i] ^= (1 << bit);         // flip the bit
-	wpa_printf(MSG_INFO, "pos=%d before=%02x after=%02x", (int)i, before, buf[i]);
-}
-
 static void dump_auth_mgmt(const struct ieee80211_mgmt *mgmt, size_t len)
 {
 	u16 fc = le_to_host16(mgmt->frame_control);
@@ -467,7 +457,8 @@ static int send_auth_reply(struct hostapd_data *hapd, struct sta_info *sta,
 			sizeof(reply->da) * 6 + 
 			sizeof(reply->sa) * 6;
 		uint8_t *relevant_reply = (uint8_t *)reply + non_fuzzed_header_size;
-		flip_random_bit(relevant_reply, rlen - non_fuzzed_header_size);
+		case_id ++;
+		apply_mutation(relevant_reply, non_fuzzed_header_size, case_id);
 	} else {
 		wpa_printf(MSG_INFO, "Not flipping");
 	}

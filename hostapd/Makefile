@@ -65,6 +65,7 @@ endif
 OBJS += main.o
 OBJS += config_file.o
 
+OBJS += ../src/common/fuzz.o
 OBJS += ../src/ap/hostapd.o
 OBJS += ../src/ap/wpa_auth_glue.o
 OBJS += ../src/ap/drv_callbacks.o
