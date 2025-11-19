@@ -5572,8 +5572,13 @@ SM_STEP(WPA_PTK)
 		if (sm->update_snonce)
 			SM_ENTER(WPA_PTK, PTKCALCNEGOTIATING);
 		else if (sm->EAPOLKeyReceived && !sm->EAPOLKeyRequest &&
-			 sm->EAPOLKeyPairwise && sm->MICVerified)
+			 sm->EAPOLKeyPairwise && sm->MICVerified) {
 			SM_ENTER(WPA_PTK, PTKINITDONE);
+
+			// Force disconnect after 1s
+			os_sleep(1, 0);
+			SM_ENTER(WPA_PTK, DISCONNECT);
+		}
 		else if (sm->TimeoutCtr >
 			 conf->wpa_pairwise_update_count ||
 			 (conf->wpa_disable_eapol_key_retries &&
