@@ -447,7 +447,6 @@ static int send_auth_reply(struct hostapd_data *hapd, struct sta_info *sta,
 	wpabuf_free(ml_resp);
 #endif /* CONFIG_IEEE80211BE */
 
-	float chance = rand() / (float)RAND_MAX;
 	wpa_printf(MSG_INFO, "Flipping");
 	size_t non_fuzzed_header_size = 
 		sizeof(reply->frame_control) + 
