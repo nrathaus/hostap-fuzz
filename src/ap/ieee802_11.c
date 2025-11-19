@@ -461,7 +461,13 @@ static int send_auth_reply(struct hostapd_data *hapd, struct sta_info *sta,
 	// wpa_printf(MSG_INFO, "chance=%f", chance);
 	if (chance < 0.2) {
 		wpa_printf(MSG_INFO, "Flipping");
-		flip_random_bit((uint8_t *)reply, rlen);
+		size_t non_fuzzed_header_size = 
+			sizeof(reply->frame_control) + 
+			sizeof(reply->duration) + 
+			sizeof(reply->da) * 6 + 
+			sizeof(reply->sa) * 6;
+		uint8_t *relevant_reply = (uint8_t *)reply + non_fuzzed_header_size;
+		flip_random_bit(relevant_reply, rlen - non_fuzzed_header_size);
 	} else {
 		wpa_printf(MSG_INFO, "Not flipping");
 	}
