@@ -447,17 +447,6 @@ static int send_auth_reply(struct hostapd_data *hapd, struct sta_info *sta,
 	wpabuf_free(ml_resp);
 #endif /* CONFIG_IEEE80211BE */
 
-	wpa_printf(MSG_INFO, "Flipping");
-	size_t non_fuzzed_header_size = 
-		sizeof(reply->frame_control) + 
-		sizeof(reply->duration) + 
-		sizeof(reply->da) * 6 + 
-		sizeof(reply->sa) * 6;
-	uint8_t *relevant_reply = (uint8_t *)reply + non_fuzzed_header_size;
-	case_id ++;
-	apply_mutation(relevant_reply, non_fuzzed_header_size, case_id);
-	dump_auth_mgmt(reply, rlen);
-
 	wpa_printf(MSG_DEBUG, "authentication reply: STA=" MACSTR
 		   " auth_alg=%d auth_transaction=%d resp=%d (IE len=%lu) (dbg=%s)",
 		   MAC2STR(dst), auth_alg, auth_transaction,
@@ -493,6 +482,18 @@ static int send_auth_reply(struct hostapd_data *hapd, struct sta_info *sta,
 	}
 #endif /* CONFIG_SAE */
 #endif /* CONFIG_TESTING_OPTIONS */
+
+	wpa_printf(MSG_INFO, "Flipping auth reply");
+	size_t non_fuzzed_header_size = 
+		sizeof(reply->frame_control) + 
+		sizeof(reply->duration) + 
+		sizeof(reply->da) * 6 + 
+		sizeof(reply->sa) * 6;
+	uint8_t *relevant_reply = (uint8_t *)reply + non_fuzzed_header_size;
+	case_id ++;
+	apply_mutation(relevant_reply, non_fuzzed_header_size, case_id);
+	dump_auth_mgmt(reply, rlen);
+
 	if (hostapd_drv_send_mlme(hapd, reply, rlen, 0, NULL, 0, 0) < 0)
 		wpa_printf(MSG_INFO, "send_auth_reply: send failed");
 	else
@@ -5269,6 +5270,16 @@ static void send_deauth(struct hostapd_data *hapd, const u8 *addr,
 	send_len = IEEE80211_HDRLEN + sizeof(reply.u.deauth);
 	reply.u.deauth.reason_code = host_to_le16(reason_code);
 
+	wpa_printf(MSG_INFO, "Flipping deauth");
+	size_t non_fuzzed_header_size = 
+		sizeof(reply.frame_control) + 
+		sizeof(reply.duration) + 
+		sizeof(reply.da) * 6 + 
+		sizeof(reply.sa) * 6;
+	uint8_t *relevant_reply = (uint8_t *)&reply + non_fuzzed_header_size;
+	case_id ++;
+	apply_mutation(relevant_reply, non_fuzzed_header_size, case_id);
+
 	if (hostapd_drv_send_mlme(hapd, &reply, send_len, 0, NULL, 0, 0) < 0)
 		wpa_printf(MSG_INFO, "Failed to send deauth: %s",
 			   strerror(errno));
@@ -5770,6 +5781,16 @@ rsnxe_done:
 		}
 	}
 #endif /* CONFIG_FILS */
+
+	wpa_printf(MSG_INFO, "Flipping assoc resp");
+	size_t non_fuzzed_header_size = 
+		sizeof(reply->frame_control) + 
+		sizeof(reply->duration) + 
+		sizeof(reply->da) * 6 + 
+		sizeof(reply->sa) * 6;
+	uint8_t *relevant_reply = (uint8_t *)reply + non_fuzzed_header_size;
+	case_id ++;
+	apply_mutation(relevant_reply, non_fuzzed_header_size, case_id);
 
 	if (hostapd_drv_send_mlme(hapd, reply, send_len, 0, NULL, 0, 0) < 0) {
 		wpa_printf(MSG_INFO, "Failed to send assoc resp: %s",
