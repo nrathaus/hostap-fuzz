@@ -1,7 +1,11 @@
 #include "utils/includes.h"
+#include "ieee802_11_defs.h"
 #include "fuzz.h"
 
 #include "utils/common.h"
+
+#include "utils/json.h"
+
 #include "wpa_common.h"
 
 enum MutKind
@@ -17,26 +21,54 @@ static const size_t NUM_INTERESTING = sizeof(interesting_values) / sizeof(intere
 
 #define NUM_MUT_KINDS 3
 
-void apply_mutation(uint8_t *buf, size_t len, int64_t case_id)
-{
-	wpa_printf(MSG_INFO, "case_id: %ld", case_id);
+static int64_t case_id = -10;
 
-	if (case_id < 0)
-		return;
+void apply_mutation(struct ieee80211_mgmt *reply, size_t len)
+{
 	if (len == 0)
 		return;
 
+	if (reply == NULL)
+		return;
+
+	size_t non_fuzzed_header_size =
+		sizeof(reply->frame_control) +
+		sizeof(reply->duration) +
+		sizeof(reply->da) +
+		sizeof(reply->sa);
+	uint8_t *relevant_reply = (uint8_t *)reply + non_fuzzed_header_size;
+
+	struct wpabuf *json_output = NULL;
+	case_id++;
+
+	json_output = wpabuf_alloc(1000);
+	json_start_object(json_output, NULL);
+	json_add_string(json_output, "msg", "progress");
+	json_value_sep(json_output);
+	json_add_int(json_output, "case_id", case_id);
+	json_end_object(json_output);
+	wpa_printf(MSG_INFO, "[fuzz] %s", (char *)wpabuf_head(json_output));
+	wpabuf_free(json_output);
+
+	if (case_id < 0)
+		return;
+
 	// Deterministic index selection
-	size_t idx = case_id % len;
+	size_t idx = case_id % (len - non_fuzzed_header_size);
 
 	// Deterministic mutation kind
 	enum MutKind kind =
-		(enum MutKind)((case_id / len) % NUM_MUT_KINDS);
+		(enum MutKind)((case_id / (len - non_fuzzed_header_size)) % NUM_MUT_KINDS);
 
 	// Parameter for bit/value selection
-	uint64_t param = case_id / (len * NUM_MUT_KINDS);
+	uint64_t param = case_id / ((len - non_fuzzed_header_size) * NUM_MUT_KINDS);
 
-	uint8_t *b = buf + idx;
+	uint8_t *b = relevant_reply + idx;
+
+	json_output = wpabuf_alloc(1000);
+	json_start_object(json_output, NULL);
+	json_add_string(json_output, "msg", "fuzz");
+	json_value_sep(json_output);
 
 	switch (kind)
 	{
@@ -44,29 +76,65 @@ void apply_mutation(uint8_t *buf, size_t len, int64_t case_id)
 	{
 		uint8_t v = interesting_values[param % NUM_INTERESTING];
 
-		wpa_printf(MSG_INFO, "MUT_SET_INTERESTING idx=%ld b=%02x v=%02x", idx, *b, v);
+		json_add_string(json_output, "type", "MUT_SET_INTERESTING");
+		json_value_sep(json_output);
+		json_add_int(json_output, "v", v);
+		json_value_sep(json_output);
+		json_add_int(json_output, "before", *b);
+		json_value_sep(json_output);
+
 		*b = v;
+
+		json_add_int(json_output, "after", *b);
+		json_value_sep(json_output);
+
 		break;
 	}
 	case MUT_BIT_FLIP:
 	{
 		uint8_t bit = (uint8_t)(param % 8);
-		wpa_printf(MSG_INFO, "MUT_BIT_FLIP idx=%ld b=%02x", idx, *b);
+
+		json_add_string(json_output, "type", "MUT_BIT_FLIP");
+		json_value_sep(json_output);
+		json_add_int(json_output, "bit", bit);
+		json_value_sep(json_output);
+		json_add_int(json_output, "before", *b);
+		json_value_sep(json_output);
 
 		*b ^= (1u << bit);
 
-		wpa_printf(MSG_INFO, "MUT_BIT_FLIP idx=%ld after b=%02x", idx, *b);
+		json_add_int(json_output, "after", *b);
+		json_value_sep(json_output);
+
 		break;
 	}
 	case MUT_BYTE_XOR:
 	{
 		uint8_t mask = (uint8_t)(param & 0xFF);
-		wpa_printf(MSG_INFO, "MUT_BYTE_XOR idx=%ld param=%02x b=%02x", idx, mask, *b);
+
+		json_add_string(json_output, "type", "MUT_BYTE_XOR");
+		json_value_sep(json_output);
+		json_add_int(json_output, "mask", mask);
+		json_value_sep(json_output);
+		json_add_int(json_output, "before", *b);
+		json_value_sep(json_output);
 
 		*b ^= mask;
 
-		wpa_printf(MSG_INFO, "MUT_BYTE_XOR idx=%ld after b=%02x", idx, *b);
+		json_add_int(json_output, "after", *b);
+		json_value_sep(json_output);
+
 		break;
 	}
 	}
+
+	char hexdump[1000] = {0};
+	for (int i = 0; i < len; i++) // Use len, as we want the whole buffer (with HDRs)
+		sprintf(hexdump + strlen(hexdump), "%02x", ((uint8_t *)reply)[i]);
+
+	json_add_string(json_output, "data", hexdump);
+
+	json_end_object(json_output);
+	wpa_printf(MSG_INFO, "[fuzz] %s", (char *)wpabuf_head(json_output));
+	wpabuf_free(json_output);
 }
