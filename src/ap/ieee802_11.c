@@ -448,20 +448,15 @@ static int send_auth_reply(struct hostapd_data *hapd, struct sta_info *sta,
 #endif /* CONFIG_IEEE80211BE */
 
 	float chance = rand() / (float)RAND_MAX;
-	// wpa_printf(MSG_INFO, "chance=%f", chance);
-	if (chance < 0.2) {
-		wpa_printf(MSG_INFO, "Flipping");
-		size_t non_fuzzed_header_size = 
-			sizeof(reply->frame_control) + 
-			sizeof(reply->duration) + 
-			sizeof(reply->da) * 6 + 
-			sizeof(reply->sa) * 6;
-		uint8_t *relevant_reply = (uint8_t *)reply + non_fuzzed_header_size;
-		case_id ++;
-		apply_mutation(relevant_reply, non_fuzzed_header_size, case_id);
-	} else {
-		wpa_printf(MSG_INFO, "Not flipping");
-	}
+	wpa_printf(MSG_INFO, "Flipping");
+	size_t non_fuzzed_header_size = 
+		sizeof(reply->frame_control) + 
+		sizeof(reply->duration) + 
+		sizeof(reply->da) * 6 + 
+		sizeof(reply->sa) * 6;
+	uint8_t *relevant_reply = (uint8_t *)reply + non_fuzzed_header_size;
+	case_id ++;
+	apply_mutation(relevant_reply, non_fuzzed_header_size, case_id);
 	dump_auth_mgmt(reply, rlen);
 
 	wpa_printf(MSG_DEBUG, "authentication reply: STA=" MACSTR
