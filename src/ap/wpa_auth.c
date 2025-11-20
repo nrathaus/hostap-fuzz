@@ -5580,6 +5580,7 @@ SM_STEP(WPA_PTK)
 			SM_ENTER(WPA_PTK, PTKINITDONE);
 
 			// Force disconnect after 1s
+			wpa_printf(MSG_INFO, "[fuzz] {\"msg\":\"disconnect\"}");
 			os_sleep(1, 0);
 			SM_ENTER(WPA_PTK, DISCONNECT);
 		}
