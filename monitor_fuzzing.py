@@ -4,7 +4,7 @@ import sys
 import json
 import subprocess
 
-import scapy
+import scapy.layers.eap
 import scapy.layers.dot11
 
 print("Starting 'hostapd'")
@@ -33,6 +33,10 @@ for line in process.stdout:
             data_unhex = bytes.fromhex(data)
             # print(f"{data_unhex=}")
 
-            packet = scapy.layers.dot11.Dot11(data_unhex)
+            packet = None
+            if json_obj["target"] == "EAPOL":
+                packet = scapy.layers.eap.EAPOL(data_unhex)
+            else:
+                packet = scapy.layers.dot11.Dot11(data_unhex)
 
             print(f"{packet=}")
