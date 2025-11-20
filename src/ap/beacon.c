@@ -33,7 +33,7 @@
 #include "dfs.h"
 #include "taxonomy.h"
 #include "ieee802_11_auth.h"
-
+#include "common/fuzz.h"
 
 #ifdef NEED_AP_MLME
 
@@ -1722,6 +1722,8 @@ void handle_probe_req(struct hostapd_data *hapd,
 			csa_offs[csa_offs_len++] =
 				params.ecsa_pos - (u8 *) params.resp;
 	}
+
+	apply_mutation("probe_req", 1 /* ieee80211_mgmt */, (uint8_t *)&params.resp, params.resp_len);
 
 	ret = hostapd_drv_send_mlme(hapd, params.resp, params.resp_len, noack,
 				    csa_offs_len ? csa_offs : NULL,
