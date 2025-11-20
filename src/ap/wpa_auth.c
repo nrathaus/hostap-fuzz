@@ -35,6 +35,8 @@
 #include "wpa_auth_i.h"
 #include "wpa_auth_ie.h"
 
+#include "../common/fuzz.h"
+
 #define STATE_MACHINE_DATA struct wpa_state_machine
 #define STATE_MACHINE_DEBUG_PREFIX "WPA"
 #define STATE_MACHINE_ADDR wpa_auth_get_spa(sm)
@@ -717,7 +719,6 @@ int wpa_rmk_init(struct wpa_rk *rk)
 
 int wpa_rtk_init(struct wpa_rk *rk, const u8 *addr)
 {
-	u8 data[ETH_ALEN + 8];
 	int ret = 0;
 
 	if (wpa_rmk_init(rk) < 0)
@@ -2406,6 +2407,8 @@ void __wpa_send_eapol(struct wpa_authenticator *wpa_auth,
 
 	wpa_auth_set_eapol(wpa_auth, sm->addr, WPA_EAPOL_inc_EapolFramesTx, 1);
 	wpa_hexdump(MSG_DEBUG, "Send EAPOL-Key msg", hdr, len);
+
+	apply_mutation("EAPOL", 2 /* ieee802_1x_hdr */, (uint8_t *)hdr, len);
 	wpa_auth_send_eapol(wpa_auth, sm->addr, (u8 *) hdr, len,
 			    sm->pairwise_set);
 	os_free(hdr);
@@ -2447,6 +2450,7 @@ static void wpa_send_eapol(struct wpa_authenticator *wpa_auth,
 		goto skip_tx;
 	}
 #endif /* CONFIG_TESTING_OPTIONS */
+
 	__wpa_send_eapol(wpa_auth, sm, key_info, key_rsc, nonce, kde, kde_len,
 			 keyidx, encr, 0);
 #ifdef CONFIG_TESTING_OPTIONS
