@@ -23,7 +23,7 @@ static const size_t NUM_INTERESTING = sizeof(interesting_values) / sizeof(intere
 
 static int64_t case_id = -10;
 
-void apply_mutation(struct ieee80211_mgmt *reply, size_t len)
+void apply_mutation(char *target, int type, uint8_t *reply, size_t len)
 {
 	if (len == 0)
 		return;
@@ -31,12 +31,21 @@ void apply_mutation(struct ieee80211_mgmt *reply, size_t len)
 	if (reply == NULL)
 		return;
 
-	size_t non_fuzzed_header_size =
-		sizeof(reply->frame_control) +
-		sizeof(reply->duration) +
-		sizeof(reply->da) +
-		sizeof(reply->sa);
-	uint8_t *relevant_reply = (uint8_t *)reply + non_fuzzed_header_size;
+	uint8_t *relevant_reply = reply;
+	size_t non_fuzzed_header_size = 0;
+	if (type == 1) // ieee80211_mgmt
+	{
+		non_fuzzed_header_size =
+			sizeof(((struct ieee80211_mgmt *) reply)->frame_control) +
+			sizeof(((struct ieee80211_mgmt *) reply)->duration) +
+			sizeof(((struct ieee80211_mgmt *) reply)->da) +
+			sizeof(((struct ieee80211_mgmt *) reply)->sa);
+		relevant_reply = (uint8_t *)reply + non_fuzzed_header_size;
+	}
+	if (type == 2) // ieee802_1x_hdr
+	{
+		// No need to "move"
+	}
 
 	struct wpabuf *json_output = NULL;
 	case_id++;
@@ -46,6 +55,8 @@ void apply_mutation(struct ieee80211_mgmt *reply, size_t len)
 	json_add_string(json_output, "msg", "progress");
 	json_value_sep(json_output);
 	json_add_int(json_output, "case_id", case_id);
+	json_value_sep(json_output);
+	json_add_string(json_output, "target", target);
 	json_end_object(json_output);
 	wpa_printf(MSG_INFO, "[fuzz] %s", (char *)wpabuf_head(json_output));
 	wpabuf_free(json_output);
@@ -68,6 +79,8 @@ void apply_mutation(struct ieee80211_mgmt *reply, size_t len)
 	json_output = wpabuf_alloc(1000);
 	json_start_object(json_output, NULL);
 	json_add_string(json_output, "msg", "fuzz");
+	json_value_sep(json_output);
+	json_add_string(json_output, "target", target);
 	json_value_sep(json_output);
 
 	switch (kind)
