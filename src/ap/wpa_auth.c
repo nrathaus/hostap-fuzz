@@ -2408,7 +2408,7 @@ void __wpa_send_eapol(struct wpa_authenticator *wpa_auth,
 	wpa_auth_set_eapol(wpa_auth, sm->addr, WPA_EAPOL_inc_EapolFramesTx, 1);
 	wpa_hexdump(MSG_DEBUG, "Send EAPOL-Key msg", hdr, len);
 
-	apply_mutation("EAPOL", 2 /* ieee802_1x_hdr */, (uint8_t *)hdr, len);
+	apply_mutation("eapol", 2 /* ieee802_1x_hdr */, (uint8_t *)hdr, len);
 	wpa_auth_send_eapol(wpa_auth, sm->addr, (u8 *) hdr, len,
 			    sm->pairwise_set);
 	os_free(hdr);
