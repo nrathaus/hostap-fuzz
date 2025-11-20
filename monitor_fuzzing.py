@@ -16,7 +16,7 @@ process = subprocess.Popen(
     bufsize=1,
 )
 
-if process is None:
+if process is None or process.stdout is None:
     print("Failed to start process")
     sys.exit(0)
 
