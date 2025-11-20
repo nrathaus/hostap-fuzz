@@ -8,6 +8,45 @@
 
 #include "wpa_common.h"
 
+#define TABLE_SIZE 1024
+
+typedef struct Entry
+{
+	char *key;
+	int value;
+	struct Entry *next;
+} Entry;
+
+static Entry *case_ids[TABLE_SIZE] = {0};
+
+unsigned int hash(const char *s)
+{
+	unsigned int h = 5381;
+	while (*s)
+		h = (h * 33) ^ *s++;
+	return h % TABLE_SIZE;
+}
+
+void dict_set(const char *key, int val)
+{
+	unsigned int h = hash(key);
+	Entry *e = malloc(sizeof(Entry));
+	e->key = strdup(key);
+	e->value = val;
+	e->next = case_ids[h];
+	case_ids[h] = e;
+}
+
+Entry *dict_get(const char *key)
+{
+	unsigned int h = hash(key);
+	for (Entry *e = case_ids[h]; e; e = e->next)
+		if (strcmp(e->key, key) == 0)
+			return e;
+
+	return NULL;
+}
+
 enum MutKind
 {
 	MUT_SET_INTERESTING = 0,
@@ -20,8 +59,6 @@ static const uint8_t interesting_values[] = {
 static const size_t NUM_INTERESTING = sizeof(interesting_values) / sizeof(interesting_values[0]);
 
 #define NUM_MUT_KINDS 3
-
-static int64_t case_id = -10;
 
 void apply_mutation(const char *target, int type, uint8_t *reply, size_t len)
 {
@@ -48,7 +85,22 @@ void apply_mutation(const char *target, int type, uint8_t *reply, size_t len)
 	}
 
 	struct wpabuf *json_output = NULL;
+
+	int64_t case_id = -10;
+	Entry *case_entry = NULL;
+	if (NULL == (case_entry = dict_get(target)))
+	{
+		// wpa_printf(MSG_INFO, "case_entry for: '%s' not found", target);
+		dict_set(target, -10);
+	}
+	else
+	{
+		case_id = case_entry->value;
+		// wpa_printf(MSG_INFO, "case_entry for: '%s' found, value: %ld", target, case_id);
+	}
+
 	case_id++;
+	dict_set(target, case_id);
 
 	json_output = wpabuf_alloc(1000);
 	json_start_object(json_output, NULL);
