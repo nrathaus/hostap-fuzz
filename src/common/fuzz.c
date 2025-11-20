@@ -54,8 +54,13 @@ enum MutKind
 	MUT_BYTE_XOR = 2
 };
 
+#define MAX_CASES_MUT_SET_INTERESTING 5
+#define MAX_CASES_MUT_BIT_FLIP 8
+#define MAX_CASES_MUT_BYTE_XOR 255
+
 static const uint8_t interesting_values[] = {
 	0x00, 0x01, 0x7F, 0x80, 0xFF};
+
 static const size_t NUM_INTERESTING = sizeof(interesting_values) / sizeof(interesting_values[0]);
 
 #define NUM_MUT_KINDS 3
@@ -67,24 +72,6 @@ void apply_mutation(const char *target, int type, uint8_t *reply, size_t len)
 
 	if (reply == NULL)
 		return;
-
-	uint8_t *relevant_reply = reply;
-	size_t non_fuzzed_header_size = 0;
-	if (type == 1) // ieee80211_mgmt
-	{
-		non_fuzzed_header_size =
-			sizeof(((struct ieee80211_mgmt *)reply)->frame_control) +
-			sizeof(((struct ieee80211_mgmt *)reply)->duration) +
-			sizeof(((struct ieee80211_mgmt *)reply)->da) +
-			sizeof(((struct ieee80211_mgmt *)reply)->sa);
-		relevant_reply = (uint8_t *)reply + non_fuzzed_header_size;
-	}
-	if (type == 2) // ieee802_1x_hdr
-	{
-		// No need to "move"
-	}
-
-	struct wpabuf *json_output = NULL;
 
 	int64_t case_id = -10;
 	Entry *case_entry = NULL;
@@ -102,19 +89,21 @@ void apply_mutation(const char *target, int type, uint8_t *reply, size_t len)
 	case_id++;
 	dict_set(target, case_id);
 
-	json_output = wpabuf_alloc(1000);
-	json_start_object(json_output, NULL);
-	json_add_string(json_output, "msg", "progress");
-	json_value_sep(json_output);
-	json_add_int(json_output, "case_id", case_id);
-	json_value_sep(json_output);
-	json_add_string(json_output, "target", target);
-	json_end_object(json_output);
-	wpa_printf(MSG_INFO, "[fuzz] %s", (char *)wpabuf_head(json_output));
-	wpabuf_free(json_output);
-
-	if (case_id < 0)
-		return;
+	uint8_t *relevant_reply = reply;
+	size_t non_fuzzed_header_size = 0;
+	if (type == 1) // ieee80211_mgmt
+	{
+		non_fuzzed_header_size =
+			sizeof(((struct ieee80211_mgmt *)reply)->frame_control) +
+			sizeof(((struct ieee80211_mgmt *)reply)->duration) +
+			sizeof(((struct ieee80211_mgmt *)reply)->da) +
+			sizeof(((struct ieee80211_mgmt *)reply)->sa);
+		relevant_reply = (uint8_t *)reply + non_fuzzed_header_size;
+	}
+	if (type == 2) // ieee802_1x_hdr
+	{
+		// No need to "move"
+	}
 
 	// Deterministic index selection
 	size_t idx = case_id % (len - non_fuzzed_header_size);
@@ -127,6 +116,45 @@ void apply_mutation(const char *target, int type, uint8_t *reply, size_t len)
 	uint64_t param = case_id / ((len - non_fuzzed_header_size) * NUM_MUT_KINDS);
 
 	uint8_t *b = relevant_reply + idx;
+
+	int64_t case_max = 100000;
+	switch (kind)
+	{
+	case MUT_SET_INTERESTING:
+	{
+		case_max = MAX_CASES_MUT_SET_INTERESTING * (len - non_fuzzed_header_size);
+	}
+	case MUT_BIT_FLIP:
+	{
+		case_max = MAX_CASES_MUT_BIT_FLIP * (len - non_fuzzed_header_size);
+	}
+	case MUT_BYTE_XOR:
+	{
+		case_max = MAX_CASES_MUT_BYTE_XOR * (len - non_fuzzed_header_size);
+	}
+	}
+
+	if (case_id > case_max)
+	{
+		// Lock it to max value
+		case_id = case_max;
+	}
+
+	struct wpabuf *json_output = wpabuf_alloc(1000);
+	json_start_object(json_output, NULL);
+	json_add_string(json_output, "msg", "progress");
+	json_value_sep(json_output);
+	json_add_int(json_output, "case_id", case_id);
+	json_value_sep(json_output);
+	json_add_int(json_output, "case_max", case_max);
+	json_value_sep(json_output);
+	json_add_string(json_output, "target", target);
+	json_end_object(json_output);
+	wpa_printf(MSG_INFO, "[fuzz] %s", (char *)wpabuf_head(json_output));
+	wpabuf_free(json_output);
+
+	if (case_id < 0 || case_id == case_max)
+		return;
 
 	json_output = wpabuf_alloc(1000);
 	json_start_object(json_output, NULL);
