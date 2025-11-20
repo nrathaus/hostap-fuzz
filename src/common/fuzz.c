@@ -36,10 +36,10 @@ void apply_mutation(const char *target, int type, uint8_t *reply, size_t len)
 	if (type == 1) // ieee80211_mgmt
 	{
 		non_fuzzed_header_size =
-			sizeof(((struct ieee80211_mgmt *) reply)->frame_control) +
-			sizeof(((struct ieee80211_mgmt *) reply)->duration) +
-			sizeof(((struct ieee80211_mgmt *) reply)->da) +
-			sizeof(((struct ieee80211_mgmt *) reply)->sa);
+			sizeof(((struct ieee80211_mgmt *)reply)->frame_control) +
+			sizeof(((struct ieee80211_mgmt *)reply)->duration) +
+			sizeof(((struct ieee80211_mgmt *)reply)->da) +
+			sizeof(((struct ieee80211_mgmt *)reply)->sa);
 		relevant_reply = (uint8_t *)reply + non_fuzzed_header_size;
 	}
 	if (type == 2) // ieee802_1x_hdr
@@ -81,6 +81,8 @@ void apply_mutation(const char *target, int type, uint8_t *reply, size_t len)
 	json_add_string(json_output, "msg", "fuzz");
 	json_value_sep(json_output);
 	json_add_string(json_output, "target", target);
+	json_value_sep(json_output);
+	json_add_int(json_output, "idx", idx);
 	json_value_sep(json_output);
 
 	switch (kind)
