@@ -11,3 +11,6 @@ compile_commands.json
 .cache
 
 local_testbed/captures/**
+local_testbed/
+CHANGELOG.md
+CHANGELOG_REPORTS/
