@@ -1,4 +1,4 @@
-#!/usr/bin/python3
+#!/usr/bin/env python3
 # You need to install scapy to get this code to work
 import sys
 import json
@@ -34,7 +34,7 @@ for line in process.stdout:
             # print(f"{data_unhex=}")
 
             packet = None
-            if json_obj["target"] == "EAPOL":
+            if json_obj["target"] == "eapol":
                 packet = scapy.layers.eap.EAPOL(data_unhex)
             else:
                 packet = scapy.layers.dot11.Dot11(data_unhex)
