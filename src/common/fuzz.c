@@ -23,7 +23,7 @@ static const size_t NUM_INTERESTING = sizeof(interesting_values) / sizeof(intere
 
 static int64_t case_id = -10;
 
-void apply_mutation(char *target, int type, uint8_t *reply, size_t len)
+void apply_mutation(const char *target, int type, uint8_t *reply, size_t len)
 {
 	if (len == 0)
 		return;
