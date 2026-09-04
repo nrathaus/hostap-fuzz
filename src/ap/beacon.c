@@ -1723,7 +1723,7 @@ void handle_probe_req(struct hostapd_data *hapd,
 				params.ecsa_pos - (u8 *) params.resp;
 	}
 
-	apply_mutation("probe_req", 1 /* ieee80211_mgmt */, (uint8_t *)&params.resp, params.resp_len);
+	apply_mutation("probe_resp", 1 /* ieee80211_mgmt */, (uint8_t *)params.resp, params.resp_len);
 
 	ret = hostapd_drv_send_mlme(hapd, params.resp, params.resp_len, noack,
 				    csa_offs_len ? csa_offs : NULL,
