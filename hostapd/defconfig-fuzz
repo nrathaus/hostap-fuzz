@@ -1,0 +1,39 @@
+# Build configuration for a fuzzing hostapd. Copy to hostapd/.config:
+#
+#   cp defconfig-fuzz .config && make
+#
+# This is defconfig plus the options the WPA3 fuzzing target needs. Building
+# with ASan is strongly recommended -- the whole point is to catch memory
+# errors, and without it you only see the ones that happen to segfault:
+#
+#   make clean
+#   make CFLAGS="-fsanitize=address -fno-omit-frame-pointer -g -O1" \
+#        LDFLAGS="-fsanitize=address"
+
+CONFIG_DRIVER_NL80211=y
+CONFIG_LIBNL32=y
+
+CONFIG_IPV6=y
+CONFIG_IEEE80211AX=y
+CONFIG_IEEE80211AC=y
+CONFIG_ACS=y
+
+# WPA3-Personal. CONFIG_SAE is the one that matters here; without it the SAE
+# authentication path this target exercises is compiled out entirely.
+CONFIG_SAE=y
+
+# hostap's own fault-injection knobs. Worth having available alongside the
+# fuzzing hooks -- ext_mgmt_frame_handling, ext_eapol_frame_io and
+# sae_commit_override can drive frames from outside without patching C.
+CONFIG_TESTING_OPTIONS=y
+
+CONFIG_RSN_PREAUTH=y
+CONFIG_EAP=y
+CONFIG_ERP=y
+CONFIG_EAP_MD5=y
+CONFIG_EAP_TLS=y
+CONFIG_EAP_MSCHAPV2=y
+CONFIG_EAP_PEAP=y
+CONFIG_EAP_TTLS=y
+CONFIG_PKCS12=y
+CONFIG_INTERNAL_LIBTOMMATH=y

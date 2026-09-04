@@ -90,6 +90,35 @@ int fuzz_env_int(const char *name, int fallback)
 	return (int)n;
 }
 
+/*
+ * Per-target resume. Target names come from the call sites and contain spaces,
+ * colons and punctuation ("auth-sae", "SAE: TESTING - commit override"), so
+ * fold them into an environment variable name: uppercase, everything that is
+ * not alphanumeric becomes '_'. Falls back to the global FUZZ_START_CASE.
+ *
+ *   FUZZ_START_AUTH_SAE=1234 ./hostapd ...
+ */
+static int fuzz_start_case(const char *target)
+{
+	const int global = fuzz_env_int("FUZZ_START_CASE", 0);
+	char name[128];
+	size_t i;
+
+	os_snprintf(name, sizeof(name), "FUZZ_START_%s", target);
+
+	for (i = 0; name[i]; i++)
+	{
+		unsigned char c = (unsigned char)name[i];
+
+		if (c >= 'a' && c <= 'z')
+			name[i] = c - 'a' + 'A';
+		else if (!((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')))
+			name[i] = '_';
+	}
+
+	return fuzz_env_int(name, global);
+}
+
 enum MutKind
 {
 	MUT_SET_INTERESTING = 0,
@@ -192,13 +221,15 @@ static void apply_mutation_int(const char *target, int type, uint8_t *reply,
 
 	if (case_entry == NULL)
 	{
-		/* FUZZ_START_CASE resumes a run at a given case and skips the
-		 * warm-up: when replaying a crash you want the mutation on the
-		 * first frame, not nine clean ones first. It applies to every
-		 * target; per-target resume is still to do. */
-		int start = fuzz_env_int("FUZZ_START_CASE", 0);
+		/* Resuming skips the warm-up: when replaying a crash you want
+		 * the mutation on the first frame, not nine clean ones. */
+		int start = fuzz_start_case(target);
 
 		case_id = start > 0 ? start : FUZZ_FIRST_CASE_ID;
+		if (start > 0)
+			wpa_printf(MSG_INFO,
+				   "[fuzz] resuming target '%s' at case %d",
+				   target, start);
 		if (dict_set(target, case_id) == NULL)
 			return;
 	}
