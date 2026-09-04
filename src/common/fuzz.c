@@ -119,6 +119,21 @@ static int fuzz_start_case(const char *target)
 	return fuzz_env_int(name, global);
 }
 
+/*
+ * Runtime kill-switch. A CONFIG_FUZZ binary is still a working AP with
+ * FUZZ_DISABLE=1, which is how you confirm a failure comes from the mutation
+ * rather than from the configuration. Resolved once.
+ */
+int fuzz_enabled(void)
+{
+	static int enabled = -1;
+
+	if (enabled < 0)
+		enabled = fuzz_env_int("FUZZ_DISABLE", 0) == 0;
+
+	return enabled;
+}
+
 enum MutKind
 {
 	MUT_SET_INTERESTING = 0,
@@ -199,6 +214,9 @@ void fuzz_log_sent_frame(const uint8_t *buf, size_t len)
 static void apply_mutation_int(const char *target, int type, uint8_t *reply,
 			       size_t len, int defer_log)
 {
+	if (!fuzz_enabled())
+		return;
+
 	if (len == 0)
 		return;
 

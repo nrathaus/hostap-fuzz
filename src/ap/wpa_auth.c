@@ -45,7 +45,9 @@
 
 static void wpa_send_eapol_timeout(void *eloop_ctx, void *timeout_ctx);
 static int wpa_sm_step(struct wpa_state_machine *sm);
+#ifdef CONFIG_FUZZ
 static void fuzz_force_disconnect(void *eloop_ctx, void *timeout_ctx);
+#endif /* CONFIG_FUZZ */
 static int wpa_verify_key_mic(int akmp, size_t pmk_len, struct wpa_ptk *PTK,
 			      u8 *data, size_t data_len);
 #ifdef CONFIG_FILS
@@ -1317,7 +1319,9 @@ void wpa_auth_sta_deinit(struct wpa_state_machine *sm)
 	sm->pending_1_of_4_timeout = 0;
 	eloop_cancel_timeout(wpa_sm_call_step, sm, NULL);
 	eloop_cancel_timeout(wpa_rekey_ptk, ELOOP_ALL_CTX, sm);
+#ifdef CONFIG_FUZZ
 	eloop_cancel_timeout(fuzz_force_disconnect, ELOOP_ALL_CTX, sm);
+#endif /* CONFIG_FUZZ */
 #ifdef CONFIG_IEEE80211R_AP
 	wpa_ft_sta_deinit(sm);
 #endif /* CONFIG_IEEE80211R_AP */
@@ -5468,6 +5472,8 @@ SM_STATE(WPA_PTK, PTKINITDONE)
 }
 
 
+#ifdef CONFIG_FUZZ
+
 /*
  * Cycle the STA once the handshake completes so the next frame gets the next
  * fuzz case. Runs from the event loop rather than blocking inside SM_STEP():
@@ -5488,8 +5494,12 @@ static void fuzz_force_disconnect(void *eloop_ctx, void *timeout_ctx)
 
 static void fuzz_schedule_disconnect(struct wpa_state_machine *sm)
 {
-	int delay_ms = fuzz_env_int("FUZZ_DISCONNECT_MS", 1000);
+	int delay_ms;
 
+	if (!fuzz_enabled())
+		return;
+
+	delay_ms = fuzz_env_int("FUZZ_DISCONNECT_MS", 1000);
 	if (delay_ms <= 0)
 		return;
 
@@ -5497,6 +5507,8 @@ static void fuzz_schedule_disconnect(struct wpa_state_machine *sm)
 	eloop_register_timeout(delay_ms / 1000, (delay_ms % 1000) * 1000,
 			       fuzz_force_disconnect, sm->wpa_auth, sm);
 }
+
+#endif /* CONFIG_FUZZ */
 
 
 SM_STEP(WPA_PTK)
@@ -5618,7 +5630,9 @@ SM_STEP(WPA_PTK)
 		else if (sm->EAPOLKeyReceived && !sm->EAPOLKeyRequest &&
 			 sm->EAPOLKeyPairwise && sm->MICVerified) {
 			SM_ENTER(WPA_PTK, PTKINITDONE);
+#ifdef CONFIG_FUZZ
 			fuzz_schedule_disconnect(sm);
+#endif /* CONFIG_FUZZ */
 		}
 		else if (sm->TimeoutCtr >
 			 conf->wpa_pairwise_update_count ||

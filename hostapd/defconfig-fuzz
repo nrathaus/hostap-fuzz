@@ -10,6 +10,10 @@
 #   make CFLAGS="-fsanitize=address -fno-omit-frame-pointer -g -O1" \
 #        LDFLAGS="-fsanitize=address"
 
+# The fuzzing hooks themselves. Without this the mutation call sites in
+# src/ap compile away to nothing and hostapd behaves as a normal AP.
+CONFIG_FUZZ=y
+
 CONFIG_DRIVER_NL80211=y
 CONFIG_LIBNL32=y
 

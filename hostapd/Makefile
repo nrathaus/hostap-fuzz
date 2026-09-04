@@ -65,7 +65,16 @@ endif
 OBJS += main.o
 OBJS += config_file.o
 
+ifdef CONFIG_FUZZ
+CFLAGS += -DCONFIG_FUZZ
+# Mark the build so `hostapd -v` can be checked from a Dockerfile or CI
+CFLAGS += -DVERSION_STR_POSTFIX=\"-fuzz\"
 OBJS += ../src/common/fuzz.o
+# fuzz.c reports through the JSON helpers, which pull in base64
+NEED_JSON=y
+NEED_BASE64=y
+endif
+
 OBJS += ../src/ap/hostapd.o
 OBJS += ../src/ap/wpa_auth_glue.o
 OBJS += ../src/ap/drv_callbacks.o

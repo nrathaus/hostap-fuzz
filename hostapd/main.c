@@ -603,6 +603,12 @@ static void show_version(void)
 		"Copyright (c) 2002-2024, Jouni Malinen <j@w1.fi> "
 		"and contributors\n",
 		VERSION_STR);
+#ifdef CONFIG_FUZZ
+	fprintf(stderr,
+		"Frame fuzzing hooks are COMPILED IN: this build mutates the\n"
+		"frames it transmits and must not be used as a real AP.\n"
+		"Set FUZZ_DISABLE=1 to run it unmodified.\n");
+#endif /* CONFIG_FUZZ */
 }
 
 

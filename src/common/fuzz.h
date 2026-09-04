@@ -2,6 +2,12 @@
 #ifndef FUZZ_H
 #define FUZZ_H
 
+#ifdef CONFIG_FUZZ
+
+/* False when FUZZ_DISABLE=1, so a fuzzing build can still be run as a normal
+ * AP without rebuilding. Always false when built without CONFIG_FUZZ. */
+int fuzz_enabled(void);
+
 /* Mutate one byte of 'buf' and log both the mutation and the resulting frame. */
 void apply_mutation(const char *target, int type, uint8_t *buf, size_t len);
 
@@ -20,5 +26,40 @@ void fuzz_log_sent_frame(const uint8_t *buf, size_t len);
 
 /* Read an integer tunable from the environment, or 'fallback' if unset. */
 int fuzz_env_int(const char *name, int fallback);
+
+#else /* CONFIG_FUZZ */
+
+/*
+ * Not a fuzzing build. Every hook compiles away to nothing, so most call sites
+ * need no #ifdef of their own and an ordinary build transmits unmodified
+ * frames. fuzz_enabled() folding to a constant 0 is what lets a caller's
+ * surrounding logic drop out as dead code.
+ */
+
+static inline int fuzz_enabled(void)
+{
+	return 0;
+}
+
+static inline void apply_mutation(const char *target, int type, uint8_t *buf,
+				  size_t len)
+{
+}
+
+static inline void apply_mutation_defer_log(const char *target, int type,
+					    uint8_t *buf, size_t len)
+{
+}
+
+static inline void fuzz_log_sent_frame(const uint8_t *buf, size_t len)
+{
+}
+
+static inline int fuzz_env_int(const char *name, int fallback)
+{
+	return fallback;
+}
+
+#endif /* CONFIG_FUZZ */
 
 #endif
