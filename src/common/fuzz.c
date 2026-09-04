@@ -70,6 +70,26 @@ Entry *dict_set(const char *key, int64_t val)
 	return e;
 }
 
+int fuzz_env_int(const char *name, int fallback)
+{
+	const char *val = getenv(name);
+	char *end;
+	long n;
+
+	if (val == NULL || *val == '\0')
+		return fallback;
+
+	n = strtol(val, &end, 0);
+	if (*end != '\0')
+	{
+		wpa_printf(MSG_INFO, "[fuzz] ignoring malformed %s='%s'",
+			   name, val);
+		return fallback;
+	}
+
+	return (int)n;
+}
+
 enum MutKind
 {
 	MUT_SET_INTERESTING = 0,
@@ -77,22 +97,78 @@ enum MutKind
 	MUT_BYTE_XOR = 2
 };
 
-#define MAX_CASES_MUT_SET_INTERESTING 5
-#define MAX_CASES_MUT_BIT_FLIP 8
-#define MAX_CASES_MUT_BYTE_XOR 255
+static const uint8_t interesting_values[] = {
+	0x00, 0x01, 0x7F, 0x80, 0xFF};
+
+#define NUM_INTERESTING (sizeof(interesting_values) / sizeof(interesting_values[0]))
+
+/* Cases per kind, per byte offset. The XOR masks deliberately start at 1: a
+ * mask of 0 is a no-op and would log a mutation that changed nothing. */
+#define CASES_MUT_SET_INTERESTING NUM_INTERESTING
+#define CASES_MUT_BIT_FLIP 8
+#define CASES_MUT_BYTE_XOR 255
+
+/*
+ * Every byte offset gets the full set of mutations before the sweep advances to
+ * the next offset, so a crash localises to one field. case_id maps onto
+ * (offset, kind, param) exactly once -- no duplicates, and no kind is cut short
+ * by another kind's range.
+ *
+ * To sweep breadth-first instead (all offsets at one mutation, then the next
+ * mutation), swap the idx/rem derivation in apply_mutation_int() to
+ * idx = case_id % fuzz_len and rem = case_id / fuzz_len. Note that this
+ * renumbers every case, so recorded case_ids from one order do not replay
+ * under the other.
+ */
+#define CASES_PER_OFFSET \
+	(CASES_MUT_SET_INTERESTING + CASES_MUT_BIT_FLIP + CASES_MUT_BYTE_XOR)
 
 /* First case_id handed out for a target; negative values are not fuzzed, so
  * this gives each target a warm-up period of unmutated frames. */
 #define FUZZ_FIRST_CASE_ID (-9)
 
-static const uint8_t interesting_values[] = {
-	0x00, 0x01, 0x7F, 0x80, 0xFF};
+/*
+ * A frame whose hexdump is being held back until the caller finishes building
+ * it (see apply_mutation_defer_log()). hostapd is single-threaded, so one
+ * pending slot is enough.
+ */
+static struct wpabuf *pending_log = NULL;
 
-static const size_t NUM_INTERESTING = sizeof(interesting_values) / sizeof(interesting_values[0]);
+static void fuzz_emit(struct wpabuf *json, const uint8_t *buf, size_t len)
+{
+	const size_t hexdump_size = 2 * len + 1;
+	char *hexdump = os_malloc(hexdump_size);
 
-#define NUM_MUT_KINDS 3
+	if (hexdump == NULL)
+	{
+		wpabuf_free(json);
+		return;
+	}
 
-void apply_mutation(const char *target, int type, uint8_t *reply, size_t len)
+	/* Use len, as we want the whole buffer (with HDRs) */
+	wpa_snprintf_hex(hexdump, hexdump_size, buf, len);
+
+	json_add_string(json, "data", hexdump);
+	json_end_object(json);
+	wpa_printf(MSG_INFO, "[fuzz] %s", (char *)wpabuf_head(json));
+
+	wpabuf_free(json);
+	os_free(hexdump);
+}
+
+void fuzz_log_sent_frame(const uint8_t *buf, size_t len)
+{
+	struct wpabuf *json = pending_log;
+
+	if (json == NULL)
+		return;
+
+	pending_log = NULL;
+	fuzz_emit(json, buf, len);
+}
+
+static void apply_mutation_int(const char *target, int type, uint8_t *reply,
+			       size_t len, int defer_log)
 {
 	if (len == 0)
 		return;
@@ -100,33 +176,44 @@ void apply_mutation(const char *target, int type, uint8_t *reply, size_t len)
 	if (reply == NULL)
 		return;
 
+	/* A frame mutated on a previous call was abandoned before it could be
+	 * sent (an error path between mutation and transmission). Drop its
+	 * held-back log rather than attaching it to this frame. */
+	if (pending_log)
+	{
+		wpa_printf(MSG_INFO,
+			   "[fuzz] previous frame was never sent, dropping its log");
+		wpabuf_free(pending_log);
+		pending_log = NULL;
+	}
+
 	int64_t case_id;
 	Entry *case_entry = dict_get(target);
 
 	if (case_entry == NULL)
 	{
-		// wpa_printf(MSG_INFO, "case_entry for: '%s' not found", target);
-		case_id = FUZZ_FIRST_CASE_ID;
+		/* FUZZ_START_CASE resumes a run at a given case and skips the
+		 * warm-up: when replaying a crash you want the mutation on the
+		 * first frame, not nine clean ones first. It applies to every
+		 * target; per-target resume is still to do. */
+		int start = fuzz_env_int("FUZZ_START_CASE", 0);
+
+		case_id = start > 0 ? start : FUZZ_FIRST_CASE_ID;
 		if (dict_set(target, case_id) == NULL)
 			return;
 	}
 	else
 	{
-		// wpa_printf(MSG_INFO, "case_entry for: '%s' found, value: %ld", target, case_entry->value);
 		case_id = case_entry->value + 1;
 		case_entry->value = case_id;
 	}
 
-	uint8_t *relevant_reply = reply;
 	size_t non_fuzzed_header_size = 0;
 	if (type == 1) // ieee80211_mgmt
 	{
-		non_fuzzed_header_size =
-			sizeof(((struct ieee80211_mgmt *)reply)->frame_control) +
-			sizeof(((struct ieee80211_mgmt *)reply)->duration) +
-			sizeof(((struct ieee80211_mgmt *)reply)->da) +
-			sizeof(((struct ieee80211_mgmt *)reply)->sa);
-		relevant_reply = (uint8_t *)reply + non_fuzzed_header_size;
+		/* Skip the whole 802.11 header: mutating bssid or seq_ctrl only
+		 * gets the frame dropped by the peer before it is parsed. */
+		non_fuzzed_header_size = IEEE80211_HDRLEN;
 	}
 	if (type == 2) // ieee802_1x_hdr
 	{
@@ -138,40 +225,11 @@ void apply_mutation(const char *target, int type, uint8_t *reply, size_t len)
 	if (len <= non_fuzzed_header_size)
 		return;
 
+	uint8_t *const relevant_reply = reply + non_fuzzed_header_size;
 	const size_t fuzz_len = len - non_fuzzed_header_size;
 
-	// Deterministic index selection
-	size_t idx = case_id % fuzz_len;
-
-	// Deterministic mutation kind
-	enum MutKind kind = (enum MutKind)((case_id / fuzz_len) % NUM_MUT_KINDS);
-
-	// Parameter for bit/value selection
-	uint64_t param = case_id / (fuzz_len * NUM_MUT_KINDS);
-
-	uint8_t *b = relevant_reply + idx;
-
-	int64_t case_max = 100000;
-	switch (kind)
-	{
-	case MUT_SET_INTERESTING:
-	{
-		case_max = MAX_CASES_MUT_SET_INTERESTING * fuzz_len;
-		break;
-	}
-	case MUT_BIT_FLIP:
-	{
-		case_max = MAX_CASES_MUT_BIT_FLIP * fuzz_len;
-		break;
-	}
-	case MUT_BYTE_XOR:
-	{
-		case_max = MAX_CASES_MUT_BYTE_XOR * fuzz_len;
-		break;
-	}
-	default:
-		break;
-	}
+	/* Total number of distinct cases for a frame of this length. */
+	const int64_t case_max = (int64_t)fuzz_len * CASES_PER_OFFSET;
 
 	if (case_id > case_max)
 	{
@@ -195,23 +253,40 @@ void apply_mutation(const char *target, int type, uint8_t *reply, size_t len)
 	wpa_printf(MSG_INFO, "[fuzz] %s", (char *)wpabuf_head(json_output));
 	wpabuf_free(json_output);
 
-	if (case_id < 0 || case_id == case_max)
+	if (case_id < 0 || case_id >= case_max)
 		return;
 
-	/* The frame is hexdumped in full (headers included), so both buffers
-	 * have to be sized from 'len' rather than a fixed guess -- wpabuf
-	 * overflow calls abort(), which would look like a target crash. */
-	const size_t hexdump_size = 2 * len + 1;
-	char *hexdump = os_malloc(hexdump_size);
-	if (hexdump == NULL)
-		return;
+	/* Deterministic (offset, kind, param) selection: see CASES_PER_OFFSET. */
+	const size_t idx = case_id / CASES_PER_OFFSET;
+	const int64_t rem = case_id % CASES_PER_OFFSET;
 
-	json_output = wpabuf_alloc(hexdump_size + 256);
-	if (json_output == NULL)
+	enum MutKind kind;
+	uint64_t param;
+
+	if (rem < (int64_t)CASES_MUT_SET_INTERESTING)
 	{
-		os_free(hexdump);
-		return;
+		kind = MUT_SET_INTERESTING;
+		param = rem;
 	}
+	else if (rem < (int64_t)(CASES_MUT_SET_INTERESTING + CASES_MUT_BIT_FLIP))
+	{
+		kind = MUT_BIT_FLIP;
+		param = rem - CASES_MUT_SET_INTERESTING;
+	}
+	else
+	{
+		kind = MUT_BYTE_XOR;
+		param = rem - CASES_MUT_SET_INTERESTING - CASES_MUT_BIT_FLIP;
+	}
+
+	uint8_t *b = relevant_reply + idx;
+
+	/* Sized from len because the frame is hexdumped in full (headers
+	 * included) -- wpabuf overflow calls abort(), which would look like a
+	 * target crash. */
+	json_output = wpabuf_alloc(2 * len + 256);
+	if (json_output == NULL)
+		return;
 
 	json_start_object(json_output, NULL);
 	json_add_string(json_output, "msg", "fuzz");
@@ -225,7 +300,7 @@ void apply_mutation(const char *target, int type, uint8_t *reply, size_t len)
 	{
 	case MUT_SET_INTERESTING:
 	{
-		uint8_t v = interesting_values[param % NUM_INTERESTING];
+		uint8_t v = interesting_values[param];
 
 		json_add_string(json_output, "type", "MUT_SET_INTERESTING");
 		json_value_sep(json_output);
@@ -243,7 +318,7 @@ void apply_mutation(const char *target, int type, uint8_t *reply, size_t len)
 	}
 	case MUT_BIT_FLIP:
 	{
-		uint8_t bit = (uint8_t)(param % 8);
+		uint8_t bit = (uint8_t)param;
 
 		json_add_string(json_output, "type", "MUT_BIT_FLIP");
 		json_value_sep(json_output);
@@ -261,7 +336,8 @@ void apply_mutation(const char *target, int type, uint8_t *reply, size_t len)
 	}
 	case MUT_BYTE_XOR:
 	{
-		uint8_t mask = (uint8_t)(param & 0xFF);
+		/* param is 0-based, masks run 1..255 */
+		uint8_t mask = (uint8_t)(param + 1);
 
 		json_add_string(json_output, "type", "MUT_BYTE_XOR");
 		json_value_sep(json_output);
@@ -279,13 +355,19 @@ void apply_mutation(const char *target, int type, uint8_t *reply, size_t len)
 	}
 	}
 
-	// Use len, as we want the whole buffer (with HDRs)
-	wpa_snprintf_hex(hexdump, hexdump_size, reply, len);
+	if (defer_log)
+		pending_log = json_output;
+	else
+		fuzz_emit(json_output, reply, len);
+}
 
-	json_add_string(json_output, "data", hexdump);
+void apply_mutation(const char *target, int type, uint8_t *reply, size_t len)
+{
+	apply_mutation_int(target, type, reply, len, 0);
+}
 
-	json_end_object(json_output);
-	wpa_printf(MSG_INFO, "[fuzz] %s", (char *)wpabuf_head(json_output));
-	wpabuf_free(json_output);
-	os_free(hexdump);
+void apply_mutation_defer_log(const char *target, int type, uint8_t *reply,
+			      size_t len)
+{
+	apply_mutation_int(target, type, reply, len, 1);
 }

@@ -45,6 +45,7 @@
 
 static void wpa_send_eapol_timeout(void *eloop_ctx, void *timeout_ctx);
 static int wpa_sm_step(struct wpa_state_machine *sm);
+static void fuzz_force_disconnect(void *eloop_ctx, void *timeout_ctx);
 static int wpa_verify_key_mic(int akmp, size_t pmk_len, struct wpa_ptk *PTK,
 			      u8 *data, size_t data_len);
 #ifdef CONFIG_FILS
@@ -1316,6 +1317,7 @@ void wpa_auth_sta_deinit(struct wpa_state_machine *sm)
 	sm->pending_1_of_4_timeout = 0;
 	eloop_cancel_timeout(wpa_sm_call_step, sm, NULL);
 	eloop_cancel_timeout(wpa_rekey_ptk, ELOOP_ALL_CTX, sm);
+	eloop_cancel_timeout(fuzz_force_disconnect, ELOOP_ALL_CTX, sm);
 #ifdef CONFIG_IEEE80211R_AP
 	wpa_ft_sta_deinit(sm);
 #endif /* CONFIG_IEEE80211R_AP */
@@ -2378,6 +2380,13 @@ void __wpa_send_eapol(struct wpa_authenticator *wpa_auth,
 		bin_clear_free(buf, key_data_len);
 	}
 
+	/* Mutate before the MIC is computed so hostapd MICs the mutated frame:
+	 * mutating afterwards makes the supplicant drop it on MIC failure before
+	 * any field is parsed. The hexdump is held back until the frame is
+	 * final, so the log shows the bytes actually transmitted. */
+	apply_mutation_defer_log("eapol", 2 /* ieee802_1x_hdr */, (uint8_t *) hdr,
+				 len);
+
 	if (key_info & WPA_KEY_INFO_MIC) {
 		if (!sm->PTK_valid || !mic_len) {
 			wpa_auth_logger(wpa_auth, wpa_auth_get_spa(sm),
@@ -2408,7 +2417,7 @@ void __wpa_send_eapol(struct wpa_authenticator *wpa_auth,
 	wpa_auth_set_eapol(wpa_auth, sm->addr, WPA_EAPOL_inc_EapolFramesTx, 1);
 	wpa_hexdump(MSG_DEBUG, "Send EAPOL-Key msg", hdr, len);
 
-	apply_mutation("eapol", 2 /* ieee802_1x_hdr */, (uint8_t *)hdr, len);
+	fuzz_log_sent_frame((const uint8_t *) hdr, len);
 	wpa_auth_send_eapol(wpa_auth, sm->addr, (u8 *) hdr, len,
 			    sm->pairwise_set);
 	os_free(hdr);
@@ -5459,6 +5468,37 @@ SM_STATE(WPA_PTK, PTKINITDONE)
 }
 
 
+/*
+ * Cycle the STA once the handshake completes so the next frame gets the next
+ * fuzz case. Runs from the event loop rather than blocking inside SM_STEP():
+ * a sleep there stalls every other STA and every registered timer.
+ *
+ * FUZZ_DISCONNECT_MS <= 0 leaves the STA connected, which is what you want when
+ * fuzzing anything past the 4-way handshake (group rekey, the data path).
+ */
+static void fuzz_force_disconnect(void *eloop_ctx, void *timeout_ctx)
+{
+	struct wpa_state_machine *sm = timeout_ctx;
+
+	wpa_printf(MSG_INFO, "[fuzz] {\"msg\":\"disconnect\"}");
+	sm->Disconnect = true;
+	wpa_sm_step(sm);
+}
+
+
+static void fuzz_schedule_disconnect(struct wpa_state_machine *sm)
+{
+	int delay_ms = fuzz_env_int("FUZZ_DISCONNECT_MS", 1000);
+
+	if (delay_ms <= 0)
+		return;
+
+	eloop_cancel_timeout(fuzz_force_disconnect, ELOOP_ALL_CTX, sm);
+	eloop_register_timeout(delay_ms / 1000, (delay_ms % 1000) * 1000,
+			       fuzz_force_disconnect, sm->wpa_auth, sm);
+}
+
+
 SM_STEP(WPA_PTK)
 {
 	struct wpa_authenticator *wpa_auth = sm->wpa_auth;
@@ -5578,11 +5618,7 @@ SM_STEP(WPA_PTK)
 		else if (sm->EAPOLKeyReceived && !sm->EAPOLKeyRequest &&
 			 sm->EAPOLKeyPairwise && sm->MICVerified) {
 			SM_ENTER(WPA_PTK, PTKINITDONE);
-
-			// Force disconnect after 1s
-			wpa_printf(MSG_INFO, "[fuzz] {\"msg\":\"disconnect\"}");
-			os_sleep(1, 0);
-			SM_ENTER(WPA_PTK, DISCONNECT);
+			fuzz_schedule_disconnect(sm);
 		}
 		else if (sm->TimeoutCtr >
 			 conf->wpa_pairwise_update_count ||
