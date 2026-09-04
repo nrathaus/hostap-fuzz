@@ -19,6 +19,7 @@
 struct fuzz_entry {
 	char *key;
 	s64 value;
+	int held;
 	struct fuzz_entry *next;
 };
 
@@ -81,6 +82,97 @@ static struct fuzz_entry * fuzz_dict_set(const char *key, s64 val)
 }
 
 
+/*
+ * Output contract: every line under the "[fuzz] " prefix is a JSON object with
+ * a "msg" key. A consumer can then parse each one without sniffing for '{',
+ * and can ignore a "msg" it does not recognise -- so a message added later
+ * breaks nobody. These two are that envelope; 'extra' is room for whatever the
+ * caller appends, on top of the object's own keys.
+ */
+static struct wpabuf * fuzz_report_start(const char *msg, size_t extra)
+{
+	struct wpabuf *json = wpabuf_alloc(extra + 256);
+
+	if (!json)
+		return NULL;
+
+	json_start_object(json, NULL);
+	json_add_string(json, "msg", msg);
+
+	return json;
+}
+
+
+static void fuzz_report_end(struct wpabuf *json)
+{
+	json_end_object(json);
+	wpa_printf(MSG_INFO, "[fuzz] %s", (char *) wpabuf_head(json));
+	wpabuf_free(json);
+}
+
+
+/* An environment tunable that could not be parsed, and was therefore ignored.
+ * The value is escaped because it is whatever the invoker typed. */
+static void fuzz_report_bad_env(const char *name, const char *value)
+{
+	size_t value_len = os_strlen(value);
+	struct wpabuf *json;
+
+	json = fuzz_report_start("bad_env",
+				 os_strlen(name) + 6 * value_len);
+	if (!json)
+		return;
+
+	json_value_sep(json);
+	json_add_string(json, "name", name);
+	json_value_sep(json);
+	if (json_add_string_escape(json, "value", value, value_len) < 0) {
+		wpabuf_free(json);
+		return;
+	}
+	fuzz_report_end(json);
+}
+
+
+/* A target starting at a resumed case rather than at the warm-up. */
+static void fuzz_report_resume(const char *target, int case_id)
+{
+	struct wpabuf *json = fuzz_report_start("resume", os_strlen(target));
+
+	if (!json)
+		return;
+
+	json_value_sep(json);
+	json_add_string(json, "target", target);
+	json_value_sep(json);
+	json_add_int(json, "case_id", case_id);
+	fuzz_report_end(json);
+}
+
+
+/*
+ * A case that was announced through "progress" and mutated, but whose frame
+ * was dropped on an error path before it could be transmitted. The consumer
+ * needs this to correct a delivery count taken from "progress", which is the
+ * only per-case message that always arrives; 'target' because each target
+ * counts separately, and 'case_id' so the lost case can be replayed through
+ * FUZZ_START_<TARGET>.
+ */
+static void fuzz_report_abandoned(const char *target, s64 case_id)
+{
+	struct wpabuf *json = fuzz_report_start("abandoned", os_strlen(target));
+
+	if (!json)
+		return;
+
+	json_value_sep(json);
+	json_add_string(json, "target", target);
+	json_value_sep(json);
+	json_add_int(json, "case_id", case_id);
+	fuzz_report_end(json);
+}
+
+
 int fuzz_env_int(const char *name, int fallback)
 {
 	const char *val = getenv(name);
@@ -92,8 +184,7 @@ int fuzz_env_int(const char *name, int fallback)
 
 	n = strtol(val, &end, 0);
 	if (*end != '\0') {
-		wpa_printf(MSG_INFO, "[fuzz] ignoring malformed %s='%s'",
-			   name, val);
+		fuzz_report_bad_env(name, val);
 		return fallback;
 	}
 
@@ -102,10 +193,31 @@ int fuzz_env_int(const char *name, int fallback)
 
 
 /*
- * Per-target resume. Target names come from the call sites and contain spaces,
- * colons and punctuation ("auth-sae", "SAE: TESTING - commit override"), so
- * fold them into an environment variable name: uppercase, everything that is
- * not alphanumeric becomes '_'. Falls back to the global FUZZ_START_CASE.
+ * Fold a target name into an environment variable name. Target names come from
+ * the call sites and contain spaces, colons and punctuation ("auth-sae",
+ * "SAE: TESTING - commit override"), so 'prefix' is followed by the target
+ * uppercased with everything that is not alphanumeric replaced by '_'.
+ */
+static void fuzz_env_name(char *buf, size_t buflen, const char *prefix,
+			  const char *target)
+{
+	size_t i;
+
+	os_snprintf(buf, buflen, "%s%s", prefix, target);
+
+	for (i = 0; buf[i]; i++) {
+		unsigned char c = (unsigned char) buf[i];
+
+		if (c >= 'a' && c <= 'z')
+			buf[i] = c - 'a' + 'A';
+		else if (!((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')))
+			buf[i] = '_';
+	}
+}
+
+
+/*
+ * Per-target resume, falling back to the global FUZZ_START_CASE.
  *
  *   FUZZ_START_AUTH_SAE=1234 ./hostapd ...
  */
@@ -113,20 +225,40 @@ static int fuzz_start_case(const char *target)
 {
 	const int global = fuzz_env_int("FUZZ_START_CASE", 0);
 	char name[128];
-	size_t i;
 
-	os_snprintf(name, sizeof(name), "FUZZ_START_%s", target);
-
-	for (i = 0; name[i]; i++) {
-		unsigned char c = (unsigned char) name[i];
-
-		if (c >= 'a' && c <= 'z')
-			name[i] = c - 'a' + 'A';
-		else if (!((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')))
-			name[i] = '_';
-	}
+	fuzz_env_name(name, sizeof(name), "FUZZ_START_", target);
 
 	return fuzz_env_int(name, global);
+}
+
+
+/*
+ * Per-target hold: the target's frames are transmitted unmutated, so the
+ * stages behind it stay reachable. Mutating an early-stage frame stops a
+ * station ever getting to a later one -- a corrupted probe response breaks
+ * security negotiation, so the station rescans instead of authenticating, and
+ * the SAE and EAPOL targets behind it never advance. Holding the earlier
+ * stages is how a later one is fuzzed:
+ *
+ *   FUZZ_HOLD_PROBE_RESP=1 FUZZ_HOLD_SAE_SEND_COMMIT=1 ./hostapd ...
+ *
+ * This is not FUZZ_START_<TARGET> parked at case_max: that skips the frame
+ * rather than answering it correctly, and what the later stages need is a
+ * well-formed reply. A held target still announces itself through "progress",
+ * so a held target and a missing one do not look the same from the outside,
+ * and it consumes no cases, so a run without the hold sweeps from the start
+ * rather than from wherever the held run left off.
+ *
+ * Resolved once per target, when the target is first seen: a hold is a property
+ * of the run, not something to change under a station mid-exchange.
+ */
+static int fuzz_hold_target(const char *target)
+{
+	char name[128];
+
+	fuzz_env_name(name, sizeof(name), "FUZZ_HOLD_", target);
+
+	return fuzz_env_int(name, 0) != 0;
 }
 
 
@@ -188,6 +320,32 @@ static const u8 interesting_values[] = { 0x00, 0x01, 0x7F, 0x80, 0xFF };
  */
 static struct wpabuf *pending_log = NULL;
 
+/* Which case that pending frame is, so it can be named if it is abandoned.
+ * pending_target points at the dict entry's own key, which lives as long as
+ * the process. Both are only meaningful while pending_log is set. */
+static const char *pending_target = NULL;
+static s64 pending_case_id = 0;
+
+
+/*
+ * What the target did with the case it just announced. The case_id/case_max/
+ * target fields are unchanged, so this is additive -- it exists because
+ * case_id alone does not say whether a case ran: the range below zero is a
+ * warm-up of unmutated frames, and a consumer clamping it to zero reports
+ * cases as complete before any has been sent.
+ */
+static const char * fuzz_state(int held, s64 case_id, s64 case_max)
+{
+	if (held)
+		return "held";
+	if (case_id < 0)
+		return "warmup";
+	if (case_id >= case_max)
+		return "done";
+
+	return "mutating";
+}
+
 
 static void fuzz_emit(struct wpabuf *json, const u8 *buf, size_t len)
 {
@@ -203,10 +361,8 @@ static void fuzz_emit(struct wpabuf *json, const u8 *buf, size_t len)
 	wpa_snprintf_hex(hexdump, hexdump_size, buf, len);
 
 	json_add_string(json, "data", hexdump);
-	json_end_object(json);
-	wpa_printf(MSG_INFO, "[fuzz] %s", (char *) wpabuf_head(json));
+	fuzz_report_end(json);
 
-	wpabuf_free(json);
 	os_free(hexdump);
 }
 
@@ -219,6 +375,7 @@ void fuzz_log_sent_frame(const u8 *buf, size_t len)
 		return;
 
 	pending_log = NULL;
+	pending_target = NULL;
 	fuzz_emit(json, buf, len);
 }
 
@@ -233,6 +390,7 @@ static void apply_mutation_int(const char *target, enum fuzz_frame_type type,
 	u8 *relevant_reply, *b;
 	s64 case_id, case_max, rem;
 	u64 param;
+	int held;
 
 	if (!fuzz_enabled())
 		return;
@@ -244,13 +402,16 @@ static void apply_mutation_int(const char *target, enum fuzz_frame_type type,
 		return;
 
 	/* A frame mutated on a previous call was abandoned before it could be
-	 * sent (an error path between mutation and transmission). Drop its
-	 * held-back log rather than attaching it to this frame. */
+	 * sent (an error path between mutation and transmission). Report the
+	 * case as lost -- it was announced through "progress" but never put on
+	 * the air -- and drop its held-back log rather than attaching it to
+	 * this frame. */
 	if (pending_log) {
-		wpa_printf(MSG_INFO,
-			   "[fuzz] previous frame was never sent, dropping its log");
+		fuzz_report_abandoned(pending_target ? pending_target :
+				      "unknown", pending_case_id);
 		wpabuf_free(pending_log);
 		pending_log = NULL;
+		pending_target = NULL;
 	}
 
 	case_entry = fuzz_dict_get(target);
@@ -260,17 +421,22 @@ static void apply_mutation_int(const char *target, enum fuzz_frame_type type,
 		int start = fuzz_start_case(target);
 
 		case_id = start > 0 ? start : FUZZ_FIRST_CASE_ID;
-		if (!fuzz_dict_set(target, case_id))
+		case_entry = fuzz_dict_set(target, case_id);
+		if (!case_entry)
 			return;
-		if (start > 0) {
-			wpa_printf(MSG_INFO,
-				   "[fuzz] resuming target '%s' at case %d",
-				   target, start);
-		}
+		case_entry->held = fuzz_hold_target(target);
+		if (start > 0)
+			fuzz_report_resume(target, start);
+	} else if (case_entry->held) {
+		/* A held target consumes no cases, so its counter does not
+		 * move and its case space is still there for a later run. */
+		case_id = case_entry->value;
 	} else {
 		case_id = case_entry->value + 1;
 		case_entry->value = case_id;
 	}
+
+	held = case_entry->held;
 
 	if (type == FUZZ_TYPE_IEEE80211_MGMT) {
 		/* Skip the whole 802.11 header: mutating bssid or seq_ctrl only
@@ -292,23 +458,24 @@ static void apply_mutation_int(const char *target, enum fuzz_frame_type type,
 	if (case_id > case_max)
 		case_id = case_max; /* lock it to max value */
 
-	json_output = wpabuf_alloc(1000);
+	json_output = fuzz_report_start("progress", os_strlen(target));
 	if (!json_output)
 		return;
 
-	json_start_object(json_output, NULL);
-	json_add_string(json_output, "msg", "progress");
 	json_value_sep(json_output);
 	json_add_int(json_output, "case_id", case_id);
 	json_value_sep(json_output);
 	json_add_int(json_output, "case_max", case_max);
 	json_value_sep(json_output);
 	json_add_string(json_output, "target", target);
-	json_end_object(json_output);
-	wpa_printf(MSG_INFO, "[fuzz] %s", (char *) wpabuf_head(json_output));
-	wpabuf_free(json_output);
+	json_value_sep(json_output);
+	json_add_string(json_output, "state",
+			fuzz_state(held, case_id, case_max));
+	fuzz_report_end(json_output);
 
-	if (case_id < 0 || case_id >= case_max)
+	/* A held target is answered correctly, so the frame goes out as built:
+	 * announced above, and deliberately unmutated. */
+	if (held || case_id < 0 || case_id >= case_max)
 		return;
 
 	/* Deterministic (offset, kind, param) selection: see CASES_PER_OFFSET */
@@ -332,12 +499,10 @@ static void apply_mutation_int(const char *target, enum fuzz_frame_type type,
 	/* Sized from len because the frame is hexdumped in full (headers
 	 * included) -- wpabuf overflow calls abort(), which would look like a
 	 * target crash. */
-	json_output = wpabuf_alloc(2 * len + 256);
+	json_output = fuzz_report_start("fuzz", 2 * len + os_strlen(target));
 	if (!json_output)
 		return;
 
-	json_start_object(json_output, NULL);
-	json_add_string(json_output, "msg", "fuzz");
 	json_value_sep(json_output);
 	json_add_string(json_output, "target", target);
 	json_value_sep(json_output);
@@ -396,10 +561,13 @@ static void apply_mutation_int(const char *target, enum fuzz_frame_type type,
 	}
 	}
 
-	if (defer_log)
+	if (defer_log) {
 		pending_log = json_output;
-	else
+		pending_target = case_entry->key;
+		pending_case_id = case_id;
+	} else {
 		fuzz_emit(json_output, reply, len);
+	}
 }
 
 

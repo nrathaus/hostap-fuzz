@@ -26,12 +26,11 @@ except ImportError:
 PREFIX = "[fuzz] "
 
 
-def env_name(target):
-    """Mirror fuzz_start_case() in src/common/fuzz.c so the replay hint is
+def env_name(target, prefix="FUZZ_START_"):
+    """Mirror fuzz_env_name() in src/common/fuzz.c so the replay hint is
     actually the variable hostapd will read."""
-    name = "FUZZ_START_" + target
     return "".join(c.upper() if c.isascii() and c.isalnum() else "_"
-                   for c in name)
+                   for c in prefix + target)
 
 
 def decode(target, data_hex):
@@ -140,6 +139,8 @@ def main():
     per_target = {}
     last = None
     progress = {}
+    # Cases hostapd announced but never put on the air, per target.
+    abandoned = {}
 
     try:
         for line in process.stdout:
@@ -149,14 +150,19 @@ def main():
             if not line.startswith(PREFIX):
                 continue
 
+            # Every [fuzz] line is a JSON object with a "msg" key: the prefix
+            # means "this line is for the consumer", so one that does not parse
+            # is a real problem rather than a note meant for a human.
             payload = line[len(PREFIX):].strip()
-            if not payload.startswith("{"):
-                continue  # human-readable [fuzz] note, not a record
-
             try:
                 obj = json.loads(payload)
             except json.JSONDecodeError as e:
                 print(f"warning: unparsable [fuzz] line ({e})",
+                      file=sys.stderr)
+                continue
+
+            if not isinstance(obj, dict) or "msg" not in obj:
+                print(f"warning: [fuzz] line carries no msg: {payload}",
                       file=sys.stderr)
                 continue
 
@@ -182,6 +188,17 @@ def main():
                     print(f"packet=<{why}> {obj.get('data', '')}")
                 else:
                     print(f"{packet=}")
+            elif msg == "abandoned":
+                # The case was announced through 'progress' but its frame was
+                # dropped on an error path before transmission, so it was never
+                # delivered. Count it rather than claiming the coverage.
+                abandoned[target] = abandoned.get(target, 0) + 1
+            elif msg == "bad_env":
+                print(f"warning: hostapd ignored {obj.get('name')}="
+                      f"{obj.get('value')!r}, it is not an integer",
+                      file=sys.stderr)
+            # Any other msg belongs to someone else. The contract is that an
+            # unknown one is safe to ignore, so a new message breaks nobody.
     except KeyboardInterrupt:
         print("\nInterrupted, stopping hostapd")
         process.terminate()
@@ -196,8 +213,15 @@ def main():
     if progress:
         print("Last case per target:")
         for target, obj in sorted(progress.items()):
+            # 'mutating' is the ordinary state and says nothing; the other
+            # three explain a target that is not advancing.
+            state = obj.get("state")
+            note = f" [{state}]" if state and state != "mutating" else ""
+            lost = abandoned.get(target)
+            if lost:
+                note += f" ({lost} announced but never sent)"
             print(f"  {target}: case {obj.get('case_id')} "
-                  f"of {obj.get('case_max')}")
+                  f"of {obj.get('case_max')}{note}")
 
     if returncode == 0:
         return 0
