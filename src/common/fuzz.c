@@ -13,7 +13,7 @@
 typedef struct Entry
 {
 	char *key;
-	int value;
+	int64_t value;
 	struct Entry *next;
 } Entry;
 
@@ -27,16 +27,6 @@ unsigned int hash(const char *s)
 	return h % TABLE_SIZE;
 }
 
-void dict_set(const char *key, int val)
-{
-	unsigned int h = hash(key);
-	Entry *e = malloc(sizeof(Entry));
-	e->key = strdup(key);
-	e->value = val;
-	e->next = case_ids[h];
-	case_ids[h] = e;
-}
-
 Entry *dict_get(const char *key)
 {
 	unsigned int h = hash(key);
@@ -45,6 +35,39 @@ Entry *dict_get(const char *key)
 			return e;
 
 	return NULL;
+}
+
+/*
+ * Insert 'key' if absent, otherwise update the existing entry in place.
+ * Returns the entry, or NULL if a new one could not be allocated.
+ */
+Entry *dict_set(const char *key, int64_t val)
+{
+	unsigned int h = hash(key);
+	Entry *e = dict_get(key);
+
+	if (e)
+	{
+		e->value = val;
+		return e;
+	}
+
+	e = malloc(sizeof(Entry));
+	if (e == NULL)
+		return NULL;
+
+	e->key = strdup(key);
+	if (e->key == NULL)
+	{
+		free(e);
+		return NULL;
+	}
+
+	e->value = val;
+	e->next = case_ids[h];
+	case_ids[h] = e;
+
+	return e;
 }
 
 enum MutKind
@@ -57,6 +80,10 @@ enum MutKind
 #define MAX_CASES_MUT_SET_INTERESTING 5
 #define MAX_CASES_MUT_BIT_FLIP 8
 #define MAX_CASES_MUT_BYTE_XOR 255
+
+/* First case_id handed out for a target; negative values are not fuzzed, so
+ * this gives each target a warm-up period of unmutated frames. */
+#define FUZZ_FIRST_CASE_ID (-9)
 
 static const uint8_t interesting_values[] = {
 	0x00, 0x01, 0x7F, 0x80, 0xFF};
@@ -73,21 +100,22 @@ void apply_mutation(const char *target, int type, uint8_t *reply, size_t len)
 	if (reply == NULL)
 		return;
 
-	int64_t case_id = -10;
-	Entry *case_entry = NULL;
-	if (NULL == (case_entry = dict_get(target)))
+	int64_t case_id;
+	Entry *case_entry = dict_get(target);
+
+	if (case_entry == NULL)
 	{
 		// wpa_printf(MSG_INFO, "case_entry for: '%s' not found", target);
-		dict_set(target, -10);
+		case_id = FUZZ_FIRST_CASE_ID;
+		if (dict_set(target, case_id) == NULL)
+			return;
 	}
 	else
 	{
-		case_id = case_entry->value;
-		// wpa_printf(MSG_INFO, "case_entry for: '%s' found, value: %ld", target, case_id);
+		// wpa_printf(MSG_INFO, "case_entry for: '%s' found, value: %ld", target, case_entry->value);
+		case_id = case_entry->value + 1;
+		case_entry->value = case_id;
 	}
-
-	case_id++;
-	dict_set(target, case_id);
 
 	uint8_t *relevant_reply = reply;
 	size_t non_fuzzed_header_size = 0;
@@ -105,15 +133,21 @@ void apply_mutation(const char *target, int type, uint8_t *reply, size_t len)
 		// No need to "move"
 	}
 
+	/* Nothing left to fuzz once the header is skipped; guard against the
+	 * subtraction below wrapping around. */
+	if (len <= non_fuzzed_header_size)
+		return;
+
+	const size_t fuzz_len = len - non_fuzzed_header_size;
+
 	// Deterministic index selection
-	size_t idx = case_id % (len - non_fuzzed_header_size);
+	size_t idx = case_id % fuzz_len;
 
 	// Deterministic mutation kind
-	enum MutKind kind =
-		(enum MutKind)((case_id / (len - non_fuzzed_header_size)) % NUM_MUT_KINDS);
+	enum MutKind kind = (enum MutKind)((case_id / fuzz_len) % NUM_MUT_KINDS);
 
 	// Parameter for bit/value selection
-	uint64_t param = case_id / ((len - non_fuzzed_header_size) * NUM_MUT_KINDS);
+	uint64_t param = case_id / (fuzz_len * NUM_MUT_KINDS);
 
 	uint8_t *b = relevant_reply + idx;
 
@@ -122,16 +156,21 @@ void apply_mutation(const char *target, int type, uint8_t *reply, size_t len)
 	{
 	case MUT_SET_INTERESTING:
 	{
-		case_max = MAX_CASES_MUT_SET_INTERESTING * (len - non_fuzzed_header_size);
+		case_max = MAX_CASES_MUT_SET_INTERESTING * fuzz_len;
+		break;
 	}
 	case MUT_BIT_FLIP:
 	{
-		case_max = MAX_CASES_MUT_BIT_FLIP * (len - non_fuzzed_header_size);
+		case_max = MAX_CASES_MUT_BIT_FLIP * fuzz_len;
+		break;
 	}
 	case MUT_BYTE_XOR:
 	{
-		case_max = MAX_CASES_MUT_BYTE_XOR * (len - non_fuzzed_header_size);
+		case_max = MAX_CASES_MUT_BYTE_XOR * fuzz_len;
+		break;
 	}
+	default:
+		break;
 	}
 
 	if (case_id > case_max)
@@ -141,6 +180,9 @@ void apply_mutation(const char *target, int type, uint8_t *reply, size_t len)
 	}
 
 	struct wpabuf *json_output = wpabuf_alloc(1000);
+	if (json_output == NULL)
+		return;
+
 	json_start_object(json_output, NULL);
 	json_add_string(json_output, "msg", "progress");
 	json_value_sep(json_output);
@@ -156,7 +198,21 @@ void apply_mutation(const char *target, int type, uint8_t *reply, size_t len)
 	if (case_id < 0 || case_id == case_max)
 		return;
 
-	json_output = wpabuf_alloc(1000);
+	/* The frame is hexdumped in full (headers included), so both buffers
+	 * have to be sized from 'len' rather than a fixed guess -- wpabuf
+	 * overflow calls abort(), which would look like a target crash. */
+	const size_t hexdump_size = 2 * len + 1;
+	char *hexdump = os_malloc(hexdump_size);
+	if (hexdump == NULL)
+		return;
+
+	json_output = wpabuf_alloc(hexdump_size + 256);
+	if (json_output == NULL)
+	{
+		os_free(hexdump);
+		return;
+	}
+
 	json_start_object(json_output, NULL);
 	json_add_string(json_output, "msg", "fuzz");
 	json_value_sep(json_output);
@@ -223,13 +279,13 @@ void apply_mutation(const char *target, int type, uint8_t *reply, size_t len)
 	}
 	}
 
-	char hexdump[1000] = {0};
-	for (int i = 0; i < len; i++) // Use len, as we want the whole buffer (with HDRs)
-		sprintf(hexdump + strlen(hexdump), "%02x", ((uint8_t *)reply)[i]);
+	// Use len, as we want the whole buffer (with HDRs)
+	wpa_snprintf_hex(hexdump, hexdump_size, reply, len);
 
 	json_add_string(json_output, "data", hexdump);
 
 	json_end_object(json_output);
 	wpa_printf(MSG_INFO, "[fuzz] %s", (char *)wpabuf_head(json_output));
 	wpabuf_free(json_output);
+	os_free(hexdump);
 }
