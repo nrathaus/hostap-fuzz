@@ -35,7 +35,7 @@
 #include "wpa_auth_i.h"
 #include "wpa_auth_ie.h"
 
-#include "../common/fuzz.h"
+#include "common/fuzz.h"
 
 #define STATE_MACHINE_DATA struct wpa_state_machine
 #define STATE_MACHINE_DEBUG_PREFIX "WPA"
@@ -2388,7 +2388,7 @@ void __wpa_send_eapol(struct wpa_authenticator *wpa_auth,
 	 * mutating afterwards makes the supplicant drop it on MIC failure before
 	 * any field is parsed. The hexdump is held back until the frame is
 	 * final, so the log shows the bytes actually transmitted. */
-	apply_mutation_defer_log("eapol", 2 /* ieee802_1x_hdr */, (uint8_t *) hdr,
+	apply_mutation_defer_log("eapol", FUZZ_TYPE_IEEE802_1X_HDR, (u8 *) hdr,
 				 len);
 
 	if (key_info & WPA_KEY_INFO_MIC) {
@@ -2421,7 +2421,7 @@ void __wpa_send_eapol(struct wpa_authenticator *wpa_auth,
 	wpa_auth_set_eapol(wpa_auth, sm->addr, WPA_EAPOL_inc_EapolFramesTx, 1);
 	wpa_hexdump(MSG_DEBUG, "Send EAPOL-Key msg", hdr, len);
 
-	fuzz_log_sent_frame((const uint8_t *) hdr, len);
+	fuzz_log_sent_frame((const u8 *) hdr, len);
 	wpa_auth_send_eapol(wpa_auth, sm->addr, (u8 *) hdr, len,
 			    sm->pairwise_set);
 	os_free(hdr);
@@ -2463,7 +2463,6 @@ static void wpa_send_eapol(struct wpa_authenticator *wpa_auth,
 		goto skip_tx;
 	}
 #endif /* CONFIG_TESTING_OPTIONS */
-
 	__wpa_send_eapol(wpa_auth, sm, key_info, key_rsc, nonce, kde, kde_len,
 			 keyidx, encr, 0);
 #ifdef CONFIG_TESTING_OPTIONS
