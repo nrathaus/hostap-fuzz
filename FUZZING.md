@@ -516,8 +516,23 @@ hostap (git.w1.fi)
   |  320eb1e09a  2026-11-18  "IEEE 802.1X auth: Add Supported Groups element
   |                           to last frame"
   v
-THIS BRANCH  <- harness re-applied here, 2026-11-18
+main  <- mirror of upstream, re-applied onto here 2026-11-18
+  |
+  +--> fuzz  <- the harness: 4 commits, this branch
 ```
+
+### Repository layout
+
+| branch | what it is |
+| --- | --- |
+| `main` | a plain mirror of hostap upstream. No harness code. Fast-forwarded from `w1fi/main`, never committed to directly. |
+| `fuzz` | the harness: `main` plus the four commits below. This is the working branch. |
+| `archive/hansblackcat-grk` | frozen: the HansBlackCat research tree, tip `5ef4d7c821` |
+| `archive/sae-fuzzing-old` | frozen: the harness before the move, tip `88cf1848fa` |
+
+`fuzz` against `main` is therefore always exactly the harness, which makes it
+reviewable as a pull request and makes "how far behind upstream are we" a question
+`git log fuzz..main` answers directly.
 
 ### Why the move
 
@@ -554,9 +569,27 @@ Both lineages are preserved unmodified:
 ### Keeping current
 
 ```sh
+# once, if the remote is not configured:
 git remote add w1fi https://w1.fi/hostap.git   # redirects to git.w1.fi/hostap.git
-git fetch w1fi && git rebase w1fi/main
+
+git fetch w1fi
+git checkout main && git merge --ff-only w1fi/main && git push origin main
+git checkout fuzz && git rebase main
+# the rebase rewrites fuzz, so publishing it needs:
+git push --force-with-lease origin fuzz
 ```
+
+Then rebuild before trusting anything — `build/` holds dependency files naming
+headers that may no longer exist upstream, and a stale one fails the build in a way
+that looks unrelated:
+
+```sh
+rm -rf build && cd hostapd && cp defconfig-fuzz .config && make -j"$(nproc)"
+python3 claude/fuzz_verify/fuzz_verify.py .          # from the repo root
+```
+
+Keep `main` tracking `origin/main`, not `w1fi/main`: upstream is read-only, and a
+bare `git push` from a branch tracking it aims at w1.fi.
 
 Rebase roughly monthly. The whole cost of the 2026-11-18 move was letting 14 months
 accumulate; the commit split below exists so that repeating it stays cheap.
