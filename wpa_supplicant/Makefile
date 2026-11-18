@@ -59,7 +59,7 @@ CFLAGS += -I$(abspath ../src/utils)
 ifndef CONFIG_NO_GITVER
 # Add VERSION_STR postfix for builds from a git repository
 ifeq ($(wildcard ../.git),../.git)
-GITVER := $(shell git describe --dirty=+)
+GITVER := $(shell git log -1 --format=%cd --date=format:%Y-%m-%d)
 ifneq ($(GITVER),)
 CFLAGS += -DGIT_VERSION_STR_POSTFIX=\"-$(GITVER)\"
 endif
