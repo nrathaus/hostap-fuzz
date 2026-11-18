@@ -102,6 +102,18 @@ OBJS += src/ap/preauth_auth.c
 OBJS += src/ap/pmksa_cache_auth.c
 OBJS += src/ap/ieee802_11_shared.c
 OBJS += src/ap/beacon.c
+ifdef CONFIG_FUZZ
+L_CFLAGS += -DCONFIG_FUZZ
+# Mark the build so `hostapd -v` can be checked from a Dockerfile or CI.
+# VERSION_STR_POSTFIX is already set above, so replace it rather than
+# redefining it on the command line.
+L_CFLAGS += -UVERSION_STR_POSTFIX
+L_CFLAGS += -DVERSION_STR_POSTFIX=\"-$(PLATFORM_VERSION)-fuzz\"
+OBJS += src/common/fuzz.c
+# fuzz.c reports through the JSON helpers, which pull in base64
+NEED_JSON=y
+NEED_BASE64=y
+endif
 OBJS += src/ap/bss_load.c
 OBJS += src/ap/neighbor_db.c
 OBJS += src/ap/rrm.c
