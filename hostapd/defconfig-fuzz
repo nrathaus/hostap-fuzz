@@ -1,0 +1,73 @@
+# Build configuration for a fuzzing hostapd. Copy to hostapd/.config:
+#
+#   cp defconfig-fuzz .config && make
+#
+# This is defconfig plus the options the WPA3 fuzzing target needs. Building
+# with ASan is strongly recommended -- the whole point is to catch memory
+# errors, and without it you only see the ones that happen to segfault:
+#
+#   make clean
+#   make CFLAGS="-fsanitize=address -fno-omit-frame-pointer -g -O1" \
+#        LDFLAGS="-fsanitize=address"
+#
+# Regenerated 2026-11-18 against upstream defconfig at 320eb1e09a. Every option
+# below was checked to still exist there.
+
+# The fuzzing hooks themselves. Without this the mutation call sites in
+# src/ap compile away to nothing and hostapd behaves as a normal AP.
+CONFIG_FUZZ=y
+
+CONFIG_DRIVER_NL80211=y
+CONFIG_LIBNL32=y
+
+CONFIG_IPV6=y
+CONFIG_IEEE80211AX=y
+CONFIG_IEEE80211AC=y
+CONFIG_ACS=y
+
+# Not optional on this upstream: hostap 320eb1e09a does not build without
+# AC + AX + BE together. he_oper_chwidth and eht_oper_chwidth are declared
+# under CONFIG_IEEE80211AX / CONFIG_IEEE80211BE in ap_config.h but used
+# unguarded in ctrl_iface_ap.c and ctrl_iface.c, and without AC the link
+# fails because ieee80211_ml_build_assoc_resp() calls hostapd_eid_vht_*().
+# Drop these once upstream fixes the guards.
+CONFIG_IEEE80211BE=y
+
+# WPA3-Personal. CONFIG_SAE is the one that matters here; without it the SAE
+# authentication path this target exercises is compiled out entirely.
+CONFIG_SAE=y
+
+# hostap's own fault-injection knobs. Worth having available alongside the
+# fuzzing hooks -- ext_mgmt_frame_handling, ext_eapol_frame_io and
+# sae_commit_override can drive frames from outside without patching C.
+CONFIG_TESTING_OPTIONS=y
+
+CONFIG_RSN_PREAUTH=y
+CONFIG_EAP=y
+CONFIG_ERP=y
+CONFIG_EAP_MD5=y
+CONFIG_EAP_TLS=y
+CONFIG_EAP_MSCHAPV2=y
+CONFIG_EAP_PEAP=y
+CONFIG_EAP_TTLS=y
+CONFIG_PKCS12=y
+CONFIG_INTERNAL_LIBTOMMATH=y
+
+# --------------------------------------------------------------------------
+# Added upstream since this harness was written. All are off here, matching
+# upstream defconfig, but the first three add new element construction to the
+# Authentication and Association Response frames this harness already mutates,
+# so turning them on widens the transmit surface rather than just adding
+# features. They are upstream-experimental: expect to be the first to fuzz
+# them, and expect findings there to be less interesting than findings in
+# shipped code.
+#
+#CONFIG_IEEE8021X_AUTH=y   # 802.1X (EAP) in Authentication frames, P802.11bi
+#CONFIG_PQC=y              # post-quantum key exchange in Authentication frames
+#CONFIG_ENC_ASSOC=y        # encrypted association frames (needed by the above)
+#CONFIG_PMKSA_PRIVACY=y
+#CONFIG_ROBUST_AV=y
+#CONFIG_AFC=y
+#
+# CONFIG_OWE became a default-on option upstream; it is left at the upstream
+# default rather than being forced here.
