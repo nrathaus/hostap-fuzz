@@ -18,6 +18,7 @@
 #include "crypto/sha384.h"
 #include "crypto/sha512.h"
 #include "crypto/random.h"
+#include "common/fuzz.h"
 #include "crypto/aes.h"
 #include "crypto/aes_siv.h"
 #include "common/ieee802_11_defs.h"
@@ -1088,6 +1089,8 @@ static int send_auth_reply(struct hostapd_data *hapd, struct sta_info *sta,
 	}
 
 #endif /* CONFIG_IEEE8021X_AUTH */
+
+	apply_mutation(dbg, FUZZ_TYPE_IEEE80211_MGMT, (u8 *) reply, rlen);
 
 	if (hostapd_drv_send_mlme(hapd, reply, rlen, 0, NULL, 0, 0) < 0)
 		wpa_printf(MSG_INFO, "send_auth_reply: send failed");
@@ -8027,6 +8030,9 @@ static void send_deauth(struct hostapd_data *hapd, const u8 *addr,
 	send_len = IEEE80211_HDRLEN + sizeof(reply.u.deauth);
 	reply.u.deauth.reason_code = host_to_le16(reason_code);
 
+	apply_mutation("deauth", FUZZ_TYPE_IEEE80211_MGMT, (u8 *) &reply,
+		       send_len);
+
 	if (hostapd_drv_send_mlme(hapd, &reply, send_len, 0, NULL, 0, 0) < 0)
 		wpa_printf(MSG_INFO, "Failed to send deauth: %s",
 			   strerror(errno));
@@ -8627,6 +8633,9 @@ rsnxe_done:
 		}
 	}
 #endif /* CONFIG_FILS */
+
+	apply_mutation("assoc_resp", FUZZ_TYPE_IEEE80211_MGMT, (u8 *) reply,
+		       send_len);
 
 	if (hostapd_drv_send_mlme(hapd, reply, send_len, 0, NULL, 0, 0) < 0) {
 		wpa_printf(MSG_INFO, "Failed to send assoc resp: %s",

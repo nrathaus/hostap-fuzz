@@ -35,6 +35,7 @@
 #include "taxonomy.h"
 #include "ieee802_11_auth.h"
 #include "robust_av.h"
+#include "common/fuzz.h"
 
 
 #ifdef NEED_AP_MLME
@@ -1824,6 +1825,9 @@ void handle_probe_req(struct hostapd_data *hapd,
 			csa_offs[csa_offs_len++] =
 				params.ecsa_pos - (u8 *) params.resp;
 	}
+
+	apply_mutation("probe_resp", FUZZ_TYPE_IEEE80211_MGMT,
+		       (u8 *) params.resp, params.resp_len);
 
 	ret = hostapd_drv_send_mlme(hostapd_mbssid_get_tx_bss(hapd),
 				    params.resp, params.resp_len, noack,
