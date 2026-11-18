@@ -110,6 +110,7 @@ has no `hapd` pointer at its call sites.
 | `FUZZ_START_CASE` | `0` | Resume every target at this case, skipping the warm-up. |
 | `FUZZ_START_<TARGET>` | — | Resume one target. Takes precedence over `FUZZ_START_CASE`. |
 | `FUZZ_HOLD_<TARGET>=1` | off | Answer one target **correctly**: its frames go out unmutated and it consumes no cases. This is how you reach a later stage — see [Phasing](#phasing). |
+| `FUZZ_SWEEP_DEPTH_FIRST=1` | off | Sweep every mutation at one byte offset before moving to the next, instead of the breadth-first default. Use it to localise a crash you have already seen — see [How the sweep works](#how-the-sweep-works). |
 
 Target names fold into variable names by uppercasing and replacing every non-alphanumeric
 character with `_`, so `auth-sae` is `FUZZ_START_AUTH_SAE` or `FUZZ_HOLD_AUTH_SAE`. The
@@ -143,8 +144,21 @@ Whichever stage first breaks the exchange starves every stage behind it: the sta
 gets far enough for those frames to be sent, so their case space is unreachable no matter
 how long the run goes.
 
-Measured against an ESP32-C6 over three ten-minute runs (full data in
-`claude/live_run/RESULTS.md`):
+Measured over ten-minute runs against two unrelated stations (full data in
+`claude/live_run/RESULTS.md`). A MikroTik hAP ax² in station mode, RouterOS 7, on
+2026-11-18:
+
+| | nothing held | all four earlier stages held |
+| --- | --- | --- |
+| `probe_resp` | 300 of 44,220 | held |
+| `sae-send-commit` | 266 of 27,872 | held |
+| `sae-send-confirm` | warm-up only | held |
+| `assoc_resp` | warm-up only | held |
+| **`eapol`** | **13** | **596** |
+| four-way handshakes | 7 | **92** |
+| associations | 7 | **174** |
+
+An ESP32-C6 on 2026-09-05, which additionally measured `probe_resp` held on its own:
 
 | | nothing held | `probe_resp` held | all four earlier stages held |
 | --- | --- | --- | --- |
@@ -155,9 +169,10 @@ Measured against an ESP32-C6 over three ten-minute runs (full data in
 | EAPOL frames mutated | 0 | 0 | **67** |
 | four-way handshakes | 9 | 9 | **38** |
 
-`FUZZ_HOLD_<TARGET>=1` is the fix, and the last column is it working: a target that had
-never been reached at all took 67 mutations once the stages ahead of it were answered
-correctly, with the station completing the handshake throughout. A held target transmits
+`FUZZ_HOLD_<TARGET>=1` is the fix, and the last column of each is it working: a target that
+had barely been reached took 596 mutations (46x) on one station and 67 on the other once
+the stages ahead of it were answered correctly, with the station completing the handshake
+throughout. A held target transmits
 the frame **as built**. Fuzz the latest stage first and work backwards:
 
 ```sh
@@ -181,22 +196,32 @@ by *skipping the case*, not by sending a well-formed reply, and a target parked 
 announces once and then goes quiet — a consumer that sums `case_max - case_id` over the
 targets it has heard from then concludes the run is finished.
 
-**Which stage blocks is station-specific — measure, do not assume.** The middle column
-above is the caution: holding `probe_resp` alone changed nothing, because on this station
+**Which stage blocks is station-specific — measure, do not assume.** The ESP32's middle
+column is the caution: holding `probe_resp` alone changed nothing, because on that station
 probe-response mutation was harmless. The sweep is depth-first, so in ten minutes it never
-got past byte offset 0, and offset 0 of a probe response is the timestamp. The stage that
-actually blocked was `sae-send-commit`, whose offset 0 breaks authentication outright —
-every one of the nine handshakes in those runs happened during that target's warm-up, and
-associations stopped the moment it began mutating. Read the `state` field per target to
-find your own blocking stage rather than inheriting this one.
+got past byte offset 0, and offset 0 of a probe response is the timestamp.
+
+Both stations then blocked at the same place, `sae-send-commit`, whose offset 0 breaks
+authentication outright. Every handshake in either control phase happened during that
+target's warm-up, and associations stopped once it began mutating — on the ax² the
+counter still climbed to 266, because the station kept retrying authentication and each
+retry drew another mutated reply, while not one of those attempts reached association.
+**A target's counter advancing does not mean the exchange behind it is reachable.** Read
+the `state` field per target, and read it against the handshake count.
 
 ### Throughput is the binding constraint
 
 Every case is delivered as a reply to a station action, so the ceiling is the station's
-reconnect cadence — 6.7 `eapol` cases a minute in the run above. At that rate `eapol`'s
-50,116 cases would take **125 hours**. The sweep is exhaustive by design; against a real
-station, plan on choosing offsets deliberately with `FUZZ_START_<TARGET>` rather than
-expecting a target to be swept.
+reconnect cadence, and that cadence varies by an order of magnitude between stations:
+**6.7** `eapol` cases a minute on the ESP32-C6, **59.6** on the hAP ax². Sweeping
+`eapol` outright is therefore 125 hours on the first and about 9 on the second. Pick the
+station with that in mind; it costs nothing and buys a factor of nine. The sweep is
+exhaustive by design, so against a slow station plan on choosing offsets deliberately with
+`FUZZ_START_<TARGET>` rather than expecting a target to be swept.
+
+This is why the sweep is [breadth-first by default](#order-breadth-first-by-default). A run
+that cannot finish should at least have touched every byte of the frame; depth-first, a
+ten-minute run touches three.
 
 ## Output
 
@@ -219,8 +244,8 @@ to get a frame offset. `data` is the whole frame, headers included, as transmitt
 
 | `msg` | when | fields |
 | --- | --- | --- |
-| `progress` | once per frame, per target, always | `case_id`, `case_max`, `target`, `state` |
-| `fuzz` | the mutation that was applied | `target`, `idx`, `type`, the kind's parameter, `before`, `after`, `data` |
+| `progress` | once per frame, per target, always | `case_id`, `case_max`, `target`, `state`, `order` |
+| `fuzz` | the mutation that was applied | `target`, `order`, `idx`, `type`, the kind's parameter, `before`, `after`, `data` |
 | `abandoned` | a case was announced but its frame was never sent | `target`, `case_id` |
 | `resume` | a target started at `FUZZ_START_…` rather than the warm-up | `target`, `case_id` |
 | `bad_env` | a `FUZZ_*` value was not an integer and was ignored | `name`, `value` |
@@ -277,8 +302,7 @@ first frame of that target.
 
 ## How the sweep works
 
-For a fuzzable region of `L` bytes, each offset gets all 268 mutations before the sweep
-advances to the next offset — so a crash localises to one field:
+For a fuzzable region of `L` bytes:
 
 ```
 268 = 5 interesting values + 8 bit flips + 255 XOR masks
@@ -291,10 +315,34 @@ no-op. The first 9 frames per target are left unmutated as a warm-up (`case_id` 
 from -9), so a client can associate before anything is corrupted. Once `case_id` reaches
 `case_max` that target stops mutating and reports a constant `case_id`.
 
-To sweep breadth-first instead (all offsets at one mutation, then the next), swap the
-`idx`/`rem` derivation in `apply_mutation_int()` — the comment at `CASES_PER_OFFSET` says
-how. Note that it renumbers every case, so recorded ids do not replay across the two
-orders.
+### Order: breadth-first by default
+
+**Breadth-first** applies one mutation at every byte offset before trying the next
+mutation anywhere. **Depth-first** (`FUZZ_SWEEP_DEPTH_FIRST=1`) runs all 268 mutations at
+offset 0, then all 268 at offset 1.
+
+Depth-first localises a crash to one field, which is what you want *after* a crash. It is
+the wrong default, because every run against a real station is bounded by the station's
+re-join rate rather than by `case_max`:
+
+| cases delivered | offsets reached, depth-first | offsets reached, breadth-first |
+| ---: | --- | --- |
+| 105 | **1** | all |
+| 596 | **3** | all, 4.9 times over |
+
+Those are not estimates. A ten-minute live run delivered 596 `eapol` cases and reached
+three byte offsets — EAPOL version, type, and the high byte of the body length. 268 of
+those cases said "this frame is not an EAPOL-Key", which a supplicant is required to
+reject. The key data, the nonce and the RSN IE begin at offset 11 and were never reached.
+Full data in `claude/sweep_ordering/README.md`.
+
+Because `rem` advances slowest under breadth-first, the five interesting values are still
+what every offset sees first.
+
+**The orders renumber every case**, so a `case_id` recorded under one does not replay
+under the other. Both `progress` and `fuzz` carry an `order` field (`"breadth"` or
+`"depth"`) for exactly that reason, and `monitor_fuzzing.py` writes
+`FUZZ_SWEEP_DEPTH_FIRST` into a repro record's `replay_env` when it applies.
 
 ## Three design decisions worth knowing
 
@@ -332,17 +380,17 @@ those knobs do not cover; `CONFIG_FUZZ` keeps the two approaches independent.
 
 ## State of verification
 
-> **Pending re-verification on the current base.** Everything in this section was
-> established against the pre-move tree (`archive/sae-fuzzing-old`, tip `88cf1848f`). The
-> hooks have since been re-applied onto hostap `320eb1e09a`, across 2127 upstream commits
-> that reworked `src/ap/wpa_auth.c` by ~944 lines and `src/ap/ieee802_11.c` by ~4591.
-> These claims describe the harness's design, which did not change, but the offline
-> harnesses and the live run must be re-run before they describe *this branch*.
-> `FUZZ_DISCONNECT_MS` timing is the likeliest to have shifted: `PTKINITDONE` is not
-> guaranteed to be reached at the same point as before.
+> **Re-verified on the current base, 2026-11-18.** The behavioural claims below were
+> first established against the pre-move tree (`archive/sae-fuzzing-old`, tip `88cf1848f`).
+> The hooks have since been re-applied onto hostap `320eb1e09a`, across 2127 upstream
+> commits that reworked `src/ap/wpa_auth.c` by ~944 lines and `src/ap/ieee802_11.c` by
+> ~4591. The live run was repeated on this branch against a second, unrelated station --
+> see [Verified against a real station](#verified-against-a-real-station). The one claim
+> most at risk, `FUZZ_DISCONNECT_MS` firing at `PTKINITDONE`, came through: 92 disconnects
+> against 92 completed handshakes.
 
 Everything below is verified by build, static inspection, ASan/UBSan unit harnesses, and
-one live run against a real WPA3-SAE station.
+two live runs against real WPA3-SAE stations.
 The behavioural half is re-runnable — no radio, no root — and should be run after any change
 to `src/common/fuzz.c`:
 
@@ -350,11 +398,19 @@ to `src/common/fuzz.c`:
 python3 claude/fuzz_verify/fuzz_verify.py .                    # 38 checks: sweep, hold, contract
 python3 claude/fuzz_output_contract/fuzz_output_contract.py .  # 4 checks: the output contract
 python3 claude/fuzz_target_phasing/phase_starvation.py ./hostapd/hostapd
+python3 claude/sweep_ordering/verify_ordering.py .             # 19 checks: sweep order
 ```
 
 
 - 2680 cases for a 34-byte frame = 10 offsets x 268, **zero duplicates**, each offset
   getting exactly 5/8/255, masks 1..255, lowest mutated byte 24, locking at `case_max`.
+- Sweep order: breadth-first is the default and the first 10 cases of a 10-offset frame
+  touch all 10 offsets, each applying `0x00`; a budget of 105 reaches every offset where
+  depth-first reaches one; `FUZZ_SWEEP_DEPTH_FIRST=1` puts the first 268 cases at offset 0
+  and `=0` does not; both orders sweep exactly 2680 cases with no duplicates and cover the
+  **identical** case space in a different sequence; `order` is reported on every `progress`
+  and `fuzz` message; and case 300 is a different mutation under each order but replays
+  identically within one.
 - 60000 mutations of a 900-byte frame with no abort (frames over ~435 bytes used to abort
   hostapd inside the logging itself).
 - `len <= header_size` leaves the buffer byte-identical; one dict entry per target after
@@ -393,8 +449,29 @@ python3 claude/fuzz_target_phasing/phase_starvation.py ./hostapd/hostapd
 
 ### Verified against a real station
 
-Run on 2026-09-05 against an ESP32-C6 over WPA3-SAE, four phases; full data in
-`claude/live_run/RESULTS.md`, reproduce with `claude/live_run/run_live.sh`:
+Run twice, against two unrelated WPA3-SAE stations; full data in
+`claude/live_run/RESULTS.md`, reproduce with `claude/live_run/run_live.sh`.
+
+**2026-11-18, on this branch** (`102638c2f`), against a MikroTik hAP ax² in station
+mode (RouterOS 7), three phases:
+
+- **Sanity, `FUZZ_DISABLE=1`**: the station associates and completes the four-way handshake
+  against a `CONFIG_FUZZ` build with the hooks off, and the logs contain **zero** `[fuzz] `
+  lines. Configuration is therefore not what any later phase is measuring.
+- **The phasing primitive works on the rebased hooks**: `eapol` went from 13 cases to
+  **596**, and handshakes from 7 to **92**, when the four stages ahead of it were held. All
+  four reported `"state":"held"` on every frame and consumed no cases.
+- **`FUZZ_DISCONNECT_MS` survived the `wpa_auth.c` rework**: 92 disconnects against 92
+  completed handshakes, exactly 1:1.
+- **EAPOL mutation still precedes MIC computation**: msg-3 dumps carry a valid MIC over the
+  already-mutated body, so the station parses the frame instead of dropping it.
+- **The output contract holds against real traffic**: **3,537 `[fuzz] ` lines** across the
+  three retained logs, every one a JSON object with a `msg`, zero parse failures.
+- **Observed, not yet explained**: 174 associations produced only 92 completed handshakes.
+  `eapol` was the only mutating target, so roughly half of the attempts were broken by
+  EAPOL-Key mutation at byte offset 0 — the EAPOL version field. No crash, no hang.
+
+**2026-09-05**, against an ESP32-C6, four phases, on the pre-move tree:
 
 - **The phasing primitive works end to end.** Holding the four stages ahead of `eapol` took
   it from 8 (warm-up only, never a single mutation) to 66 cases and 67 mutated frames, with
@@ -415,7 +492,9 @@ Still unexercised:
 
 - the group rekey and data path (`FUZZ_DISCONNECT_MS=0`), which is where a station that
   stays connected would take the sweep
-- any target past byte offset 0 — see the throughput note under [Phasing](#phasing)
+- any target past byte offset 2 **on hardware**. The breadth-first default is verified
+  offline (19 checks, `claude/sweep_ordering/verify_ordering.py`) but has not yet had a
+  live run; the measured numbers above all predate it.
 - `interface=wlan0` in `hostapd-wpa3.conf` is a placeholder. On a machine where `wlan0` is
   the uplink, it is a dangerous one — `claude/live_run/run_live.sh` generates its own config
   rather than using it, refuses any interface holding the default route or an association,

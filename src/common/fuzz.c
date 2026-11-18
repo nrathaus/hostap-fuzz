@@ -278,6 +278,32 @@ int fuzz_enabled(void)
 }
 
 
+/*
+ * Sweep order. Breadth-first by default: one mutation applied at every byte
+ * offset before the next mutation is tried anywhere. Resolved once.
+ *
+ * Depth-first -- the whole set of mutations at offset 0, then offset 1 -- is
+ * what you want once a crash has been seen and the question is which field
+ * caused it. It is the wrong order for a run bounded by anything other than the
+ * full case space, which against a real station every run is: the cases are
+ * delivered as replies to station actions, so the rate is set by how fast the
+ * station re-joins. A measured ten-minute run reached case 596 of an EAPOL-Key
+ * frame's 32,428, which depth-first is three byte offsets out of 121 -- every
+ * one of them a fixed header field, with the key data and the RSN IE behind
+ * them untouched. Breadth-first the same 596 cases are 4.9 passes over every
+ * byte of the frame.
+ */
+static int fuzz_sweep_depth_first(void)
+{
+	static int depth_first = -1;
+
+	if (depth_first < 0)
+		depth_first = fuzz_env_int("FUZZ_SWEEP_DEPTH_FIRST", 0) != 0;
+
+	return depth_first;
+}
+
+
 enum mut_kind {
 	MUT_SET_INTERESTING = 0,
 	MUT_BIT_FLIP = 1,
@@ -295,16 +321,24 @@ static const u8 interesting_values[] = { 0x00, 0x01, 0x7F, 0x80, 0xFF };
 #define CASES_MUT_BYTE_XOR 255
 
 /*
- * Every byte offset gets the full set of mutations before the sweep advances to
- * the next offset, so a crash localises to one field. case_id maps onto
- * (offset, kind, param) exactly once -- no duplicates, and no kind is cut short
- * by another kind's range.
+ * case_id maps onto (offset, kind, param) exactly once under either order -- no
+ * duplicates, and no kind is cut short by another kind's range. The two orders
+ * cover the same case space and differ only in the sequence:
  *
- * To sweep breadth-first instead (all offsets at one mutation, then the next
- * mutation), swap the idx/rem derivation in apply_mutation_int() to
- * idx = case_id % fuzz_len and rem = case_id / fuzz_len. Note that this
- * renumbers every case, so recorded case_ids from one order do not replay
- * under the other.
+ *   breadth-first (default)  idx = case_id % fuzz_len
+ *                            rem = case_id / fuzz_len
+ *   depth-first              idx = case_id / CASES_PER_OFFSET
+ *                            rem = case_id % CASES_PER_OFFSET
+ *
+ * Because rem advances slowest under breadth-first, and rem 0..4 select
+ * MUT_SET_INTERESTING, the five interesting values are still what every offset
+ * sees first.
+ *
+ * The orders renumber every case, so a case_id recorded under one does not
+ * replay under the other. Both the "progress" and "fuzz" messages carry an
+ * "order" field for that reason: a consumer that replays a recorded case_id
+ * without checking it will reproduce a different frame and report the crash as
+ * non-reproducible.
  */
 #define CASES_PER_OFFSET \
 	(CASES_MUT_SET_INTERESTING + CASES_MUT_BIT_FLIP + CASES_MUT_BYTE_XOR)
@@ -471,6 +505,9 @@ static void apply_mutation_int(const char *target, enum fuzz_frame_type type,
 	json_value_sep(json_output);
 	json_add_string(json_output, "state",
 			fuzz_state(held, case_id, case_max));
+	json_value_sep(json_output);
+	json_add_string(json_output, "order",
+			fuzz_sweep_depth_first() ? "depth" : "breadth");
 	fuzz_report_end(json_output);
 
 	/* A held target is answered correctly, so the frame goes out as built:
@@ -479,8 +516,13 @@ static void apply_mutation_int(const char *target, enum fuzz_frame_type type,
 		return;
 
 	/* Deterministic (offset, kind, param) selection: see CASES_PER_OFFSET */
-	idx = case_id / CASES_PER_OFFSET;
-	rem = case_id % CASES_PER_OFFSET;
+	if (fuzz_sweep_depth_first()) {
+		idx = case_id / CASES_PER_OFFSET;
+		rem = case_id % CASES_PER_OFFSET;
+	} else {
+		idx = (size_t) (case_id % (s64) fuzz_len);
+		rem = case_id / (s64) fuzz_len;
+	}
 
 	if (rem < (s64) CASES_MUT_SET_INTERESTING) {
 		kind = MUT_SET_INTERESTING;
@@ -505,6 +547,9 @@ static void apply_mutation_int(const char *target, enum fuzz_frame_type type,
 
 	json_value_sep(json_output);
 	json_add_string(json_output, "target", target);
+	json_value_sep(json_output);
+	json_add_string(json_output, "order",
+			fuzz_sweep_depth_first() ? "depth" : "breadth");
 	json_value_sep(json_output);
 	json_add_int(json_output, "idx", idx);
 	json_value_sep(json_output);

@@ -84,11 +84,17 @@ def write_repro(repro_dir, last, returncode):
         path = os.path.join(repro_dir, f"{base}-{n}.json")
         n += 1
 
+    #  The sweep orders renumber every case, so a case_id replayed under the
+    #  wrong one reproduces a different frame and looks non-reproducible.
+    replay_env = {env_name(target): case_id}
+    if last.get("order") == "depth":
+        replay_env["FUZZ_SWEEP_DEPTH_FIRST"] = 1
+
     with open(path, "w") as f:
         json.dump({
             "exit": describe_exit(returncode),
             "returncode": returncode,
-            "replay_env": {env_name(target): case_id},
+            "replay_env": replay_env,
             "case": last,
         }, f, indent=2)
 
