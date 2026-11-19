@@ -304,44 +304,103 @@ static int fuzz_sweep_depth_first(void)
 }
 
 
-enum mut_kind {
-	MUT_SET_INTERESTING = 0,
-	MUT_BIT_FLIP = 1,
-	MUT_BYTE_XOR = 2
-};
-
 static const u8 interesting_values[] = { 0x00, 0x01, 0x7F, 0x80, 0xFF };
 
 #define NUM_INTERESTING ARRAY_SIZE(interesting_values)
 
-/* Cases per kind, per byte offset. The XOR masks deliberately start at 1: a
- * mask of 0 is a no-op and would log a mutation that changed nothing. */
-#define CASES_MUT_SET_INTERESTING NUM_INTERESTING
-#define CASES_MUT_BIT_FLIP 8
-#define CASES_MUT_BYTE_XOR 255
+/*
+ * Cases per byte offset: the XOR masks 1..255. A mask of 0 is excluded because
+ * it is a no-op, so the masks are exactly the 255 values a byte can be changed
+ * to, each reached exactly once -- an offset's sweep is therefore exhaustive
+ * and duplicate-free by construction.
+ *
+ * This replaced a 268-case offset made of 5 "set to an interesting value"
+ * cases, 8 single-bit flips and these same 255 masks. The first 13 were all
+ * duplicates: a bit flip is an XOR by a power of two, and setting a byte to v
+ * is an XOR by orig ^ v, so for every possible original byte each of the 13
+ * repeated a value the mask sweep already produced -- or, where v was the byte
+ * it already held, changed nothing at all. What those kinds really supplied
+ * was an *order*, and that is kept below in fuzz_xor_mask().
+ */
+#define CASES_PER_OFFSET 255
 
 /*
- * case_id maps onto (offset, kind, param) exactly once under either order -- no
- * duplicates, and no kind is cut short by another kind's range. The two orders
- * cover the same case space and differ only in the sequence:
+ * case_id maps onto (offset, mask) exactly once under either order. The two
+ * orders cover the same case space and differ only in the sequence:
  *
  *   breadth-first (default)  idx = case_id % fuzz_len
  *                            rem = case_id / fuzz_len
  *   depth-first              idx = case_id / CASES_PER_OFFSET
  *                            rem = case_id % CASES_PER_OFFSET
  *
- * Because rem advances slowest under breadth-first, and rem 0..4 select
- * MUT_SET_INTERESTING, the five interesting values are still what every offset
- * sees first.
- *
  * The orders renumber every case, so a case_id recorded under one does not
  * replay under the other. Both the "progress" and "fuzz" messages carry an
  * "order" field for that reason: a consumer that replays a recorded case_id
  * without checking it will reproduce a different frame and report the crash as
- * non-reproducible.
+ * non-reproducible. Note that "order" does not distinguish a change to
+ * CASES_PER_OFFSET itself, which renumbers just as thoroughly.
  */
-#define CASES_PER_OFFSET \
-	(CASES_MUT_SET_INTERESTING + CASES_MUT_BIT_FLIP + CASES_MUT_BYTE_XOR)
+
+/*
+ * The 255 masks in the order they are applied to a byte currently holding
+ * 'orig'. Every mask 1..255 appears exactly once; what this decides is which
+ * of them a run that never finishes an offset actually gets to, which against
+ * a real station is every run. The order is:
+ *
+ *   1. the masks that set the byte to one of 'interesting_values'
+ *   2. the single-bit flips
+ *   3. everything else, ascending
+ *
+ * rem advances slowest under the breadth-first sweep, so this is what every
+ * offset in the frame sees first. It is the old 5-interesting-then-8-bit-flips
+ * opening, now costing no extra cases: a measured ten-minute live run reached
+ * rem 4 of 268, which is to say the interesting values were the only cases
+ * that ran at all.
+ *
+ * A mask an earlier rule already emitted is skipped when a later one reaches
+ * it: orig ^ v is 0 when the byte already holds v, and some of those masks are
+ * powers of two. So the three rules are not a fixed 5/8/242 split -- how many
+ * each contributes depends on 'orig' -- but their union is always 1..255.
+ */
+static u8 fuzz_xor_mask(u8 orig, size_t rem)
+{
+	u8 emitted[256];
+	size_t n = 0;
+	unsigned int i;
+
+	os_memset(emitted, 0, sizeof(emitted));
+	emitted[0] = 1; /* a mask of 0 changes nothing, so it is never a case */
+
+	for (i = 0; i < NUM_INTERESTING; i++) {
+		u8 mask = orig ^ interesting_values[i];
+
+		if (emitted[mask])
+			continue;
+		emitted[mask] = 1;
+		if (n++ == rem)
+			return mask;
+	}
+
+	for (i = 0; i < 8; i++) {
+		u8 mask = 1U << i;
+
+		if (emitted[mask])
+			continue;
+		emitted[mask] = 1;
+		if (n++ == rem)
+			return mask;
+	}
+
+	for (i = 1; i < 256; i++) {
+		if (emitted[i])
+			continue;
+		if (n++ == rem)
+			return (u8) i;
+	}
+
+	return 0; /* unreachable: the caller holds rem < CASES_PER_OFFSET */
+}
+
 
 /* First case_id handed out for a target; negative values are not fuzzed, so
  * this gives each target a warm-up period of unmutated frames. */
@@ -420,10 +479,8 @@ static void apply_mutation_int(const char *target, enum fuzz_frame_type type,
 	struct fuzz_entry *case_entry;
 	size_t non_fuzzed_header_size = 0, fuzz_len, idx;
 	struct wpabuf *json_output;
-	enum mut_kind kind;
-	u8 *relevant_reply, *b;
+	u8 *relevant_reply, *b, mask;
 	s64 case_id, case_max, rem;
-	u64 param;
 	int held;
 
 	if (!fuzz_enabled())
@@ -515,7 +572,7 @@ static void apply_mutation_int(const char *target, enum fuzz_frame_type type,
 	if (held || case_id < 0 || case_id >= case_max)
 		return;
 
-	/* Deterministic (offset, kind, param) selection: see CASES_PER_OFFSET */
+	/* Deterministic (offset, mask) selection: see CASES_PER_OFFSET */
 	if (fuzz_sweep_depth_first()) {
 		idx = case_id / CASES_PER_OFFSET;
 		rem = case_id % CASES_PER_OFFSET;
@@ -524,19 +581,8 @@ static void apply_mutation_int(const char *target, enum fuzz_frame_type type,
 		rem = case_id / (s64) fuzz_len;
 	}
 
-	if (rem < (s64) CASES_MUT_SET_INTERESTING) {
-		kind = MUT_SET_INTERESTING;
-		param = rem;
-	} else if (rem < (s64) (CASES_MUT_SET_INTERESTING +
-				CASES_MUT_BIT_FLIP)) {
-		kind = MUT_BIT_FLIP;
-		param = rem - CASES_MUT_SET_INTERESTING;
-	} else {
-		kind = MUT_BYTE_XOR;
-		param = rem - CASES_MUT_SET_INTERESTING - CASES_MUT_BIT_FLIP;
-	}
-
 	b = relevant_reply + idx;
+	mask = fuzz_xor_mask(*b, (size_t) rem);
 
 	/* Sized from len because the frame is hexdumped in full (headers
 	 * included) -- wpabuf overflow calls abort(), which would look like a
@@ -554,57 +600,19 @@ static void apply_mutation_int(const char *target, enum fuzz_frame_type type,
 	json_add_int(json_output, "idx", idx);
 	json_value_sep(json_output);
 
-	switch (kind) {
-	case MUT_SET_INTERESTING: {
-		u8 v = interesting_values[param];
+	/* "type" is carried for the consumers that switch on it, and so that a
+	 * kind added later is distinguishable; there is only the one now. */
+	json_add_string(json_output, "type", "MUT_BYTE_XOR");
+	json_value_sep(json_output);
+	json_add_int(json_output, "mask", mask);
+	json_value_sep(json_output);
+	json_add_int(json_output, "before", *b);
+	json_value_sep(json_output);
 
-		json_add_string(json_output, "type", "MUT_SET_INTERESTING");
-		json_value_sep(json_output);
-		json_add_int(json_output, "v", v);
-		json_value_sep(json_output);
-		json_add_int(json_output, "before", *b);
-		json_value_sep(json_output);
+	*b ^= mask;
 
-		*b = v;
-
-		json_add_int(json_output, "after", *b);
-		json_value_sep(json_output);
-		break;
-	}
-	case MUT_BIT_FLIP: {
-		u8 bit = (u8) param;
-
-		json_add_string(json_output, "type", "MUT_BIT_FLIP");
-		json_value_sep(json_output);
-		json_add_int(json_output, "bit", bit);
-		json_value_sep(json_output);
-		json_add_int(json_output, "before", *b);
-		json_value_sep(json_output);
-
-		*b ^= 1U << bit;
-
-		json_add_int(json_output, "after", *b);
-		json_value_sep(json_output);
-		break;
-	}
-	case MUT_BYTE_XOR: {
-		/* param is 0-based, masks run 1..255 */
-		u8 mask = (u8) (param + 1);
-
-		json_add_string(json_output, "type", "MUT_BYTE_XOR");
-		json_value_sep(json_output);
-		json_add_int(json_output, "mask", mask);
-		json_value_sep(json_output);
-		json_add_int(json_output, "before", *b);
-		json_value_sep(json_output);
-
-		*b ^= mask;
-
-		json_add_int(json_output, "after", *b);
-		json_value_sep(json_output);
-		break;
-	}
-	}
+	json_add_int(json_output, "after", *b);
+	json_value_sep(json_output);
 
 	if (defer_log) {
 		pending_log = json_output;

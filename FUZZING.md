@@ -234,7 +234,7 @@ monitor reports it instead of silently swallowing it.
 Two lines per mutated frame:
 
 ```
-[fuzz] {"msg":"progress","case_id":1234,"case_max":2680,"target":"auth-sae","state":"mutating"}
+[fuzz] {"msg":"progress","case_id":1234,"case_max":2550,"target":"auth-sae","state":"mutating"}
 [fuzz] {"msg":"fuzz","target":"auth-sae","idx":4,"type":"MUT_BYTE_XOR","mask":150,
         "before":0,"after":150,"data":"b0003a01..."}
 ```
@@ -245,7 +245,7 @@ to get a frame offset. `data` is the whole frame, headers included, as transmitt
 | `msg` | when | fields |
 | --- | --- | --- |
 | `progress` | once per frame, per target, always | `case_id`, `case_max`, `target`, `state`, `order` |
-| `fuzz` | the mutation that was applied | `target`, `order`, `idx`, `type`, the kind's parameter, `before`, `after`, `data` |
+| `fuzz` | the mutation that was applied | `target`, `order`, `idx`, `type`, `mask`, `before`, `after`, `data` |
 | `abandoned` | a case was announced but its frame was never sent | `target`, `case_id` |
 | `resume` | a target started at `FUZZ_START_…` rather than the warm-up | `target`, `case_id` |
 | `bad_env` | a `FUZZ_*` value was not an integer and was ignored | `name`, `value` |
@@ -305,21 +305,50 @@ first frame of that target.
 For a fuzzable region of `L` bytes:
 
 ```
-268 = 5 interesting values + 8 bit flips + 255 XOR masks
-case_max = L * 268
+255 = the XOR masks 1..255
+case_max = L * 255
 ```
 
-`case_id` maps onto `(offset, kind, param)` exactly once: no duplicates, and no kind is
-cut short by another's range. XOR masks run 1..255 rather than 0..255 because mask 0 is a
-no-op. The first 9 frames per target are left unmutated as a warm-up (`case_id` counts up
-from -9), so a client can associate before anything is corrupted. Once `case_id` reaches
-`case_max` that target stops mutating and reports a constant `case_id`.
+`case_id` maps onto `(offset, mask)` exactly once. Masks run 1..255 rather than 0..255
+because mask 0 is a no-op, so the 255 cases at an offset are precisely the 255 values that
+byte can be changed to — each sent once, none twice. The first 9 frames per target are
+left unmutated as a warm-up (`case_id` counts up from -9), so a client can associate
+before anything is corrupted. Once `case_id` reaches `case_max` that target stops mutating
+and reports a constant `case_id`.
+
+There used to be 268 cases per offset: 5 "set the byte to an interesting value", 8
+single-bit flips, then these same 255 masks. The first 13 were all duplicates. A bit flip
+is an XOR by a power of two, and setting a byte to `v` is an XOR by `orig ^ v`, so for
+every possible original byte each of the 13 repeated a value the mask sweep already
+produced — or, where the byte already held `v`, changed nothing at all. Dropping them cost
+no coverage and saves 4.9% of every declared space. What those kinds really supplied was
+an **order**, and that is kept: see below.
+
+### Which masks come first
+
+The masks are not applied in numeric order. For a byte currently holding `orig`, the
+schedule is:
+
+1. the masks that set it to `0x00`, `0x01`, `0x7F`, `0x80`, `0xFF` — that is, `orig ^ v`
+2. the single-bit flips
+3. everything else, ascending
+
+skipping any mask an earlier rule already emitted. The union is always the whole of
+1..255, so the schedule is a permutation and the offset's sweep stays exhaustive; how many
+cases each rule contributes depends on `orig`. A byte that already holds one of the
+interesting values has no "set it to that" case at all, and spends the freed slot on a bit
+flip instead of on a no-op — which is one of the 13 the old scheme wasted.
+
+This matters because `rem` advances slowest under the breadth-first sweep, so these are
+passes over the whole frame and a bounded run gets only the first few of them. The
+measured ten-minute run below reached `rem` 4: under the old scheme that was the five
+interesting values and nothing else, so the order is doing the real work, not the kinds.
 
 ### Order: breadth-first by default
 
 **Breadth-first** applies one mutation at every byte offset before trying the next
-mutation anywhere. **Depth-first** (`FUZZ_SWEEP_DEPTH_FIRST=1`) runs all 268 mutations at
-offset 0, then all 268 at offset 1.
+mutation anywhere. **Depth-first** (`FUZZ_SWEEP_DEPTH_FIRST=1`) runs all 255 mutations at
+offset 0, then all 255 at offset 1.
 
 Depth-first localises a crash to one field, which is what you want *after* a crash. It is
 the wrong default, because every run against a real station is bounded by the station's
@@ -331,18 +360,18 @@ re-join rate rather than by `case_max`:
 | 596 | **3** | all, 4.9 times over |
 
 Those are not estimates. A ten-minute live run delivered 596 `eapol` cases and reached
-three byte offsets — EAPOL version, type, and the high byte of the body length. 268 of
-those cases said "this frame is not an EAPOL-Key", which a supplicant is required to
-reject. The key data, the nonce and the RSN IE begin at offset 11 and were never reached.
-Full data in `claude/sweep_ordering/README.md`.
-
-Because `rem` advances slowest under breadth-first, the five interesting values are still
-what every offset sees first.
+three byte offsets — EAPOL version, type, and the high byte of the body length. A whole
+offset's worth of those cases said "this frame is not an EAPOL-Key", which a supplicant is
+required to reject. The key data, the nonce and the RSN IE begin at offset 11 and were
+never reached. Full data in `claude/sweep_ordering/README.md`.
 
 **The orders renumber every case**, so a `case_id` recorded under one does not replay
 under the other. Both `progress` and `fuzz` carry an `order` field (`"breadth"` or
 `"depth"`) for exactly that reason, and `monitor_fuzzing.py` writes
-`FUZZ_SWEEP_DEPTH_FIRST` into a repro record's `replay_env` when it applies.
+`FUZZ_SWEEP_DEPTH_FIRST` into a repro record's `replay_env` when it applies. Note that
+`order` does not distinguish a change to the number of cases per offset, which renumbers
+just as thoroughly: the 268 -> 255 change above invalidates every `case_id` recorded
+before it.
 
 ## Three design decisions worth knowing
 
@@ -395,19 +424,27 @@ The behavioural half is re-runnable — no radio, no root — and should be run 
 to `src/common/fuzz.c`:
 
 ```sh
-python3 claude/fuzz_verify/fuzz_verify.py .                    # 38 checks: sweep, hold, contract
+python3 claude/fuzz_verify/fuzz_verify.py .                    # 42 checks: sweep, hold, contract
 python3 claude/fuzz_output_contract/fuzz_output_contract.py .  # 4 checks: the output contract
 python3 claude/fuzz_target_phasing/phase_starvation.py ./hostapd/hostapd
 python3 claude/sweep_ordering/verify_ordering.py .             # 19 checks: sweep order
 ```
 
 
-- 2680 cases for a 34-byte frame = 10 offsets x 268, **zero duplicates**, each offset
-  getting exactly 5/8/255, masks 1..255, lowest mutated byte 24, locking at `case_max`.
+- 2550 cases for a 34-byte frame = 10 offsets x 255, **zero duplicates**, each offset
+  getting each of the masks 1..255 exactly once, lowest mutated byte 24, locking at
+  `case_max`.
+- No case is wasted: at every offset the 255 cases leave the byte at 255 *distinct*
+  values — every value it can hold other than the one it came with — and none of them
+  leaves it unchanged. This is the 268 -> 255 change; under the old scheme 13 of the 268
+  repeated a value already sent at that offset, for all 256 possible original bytes.
+- The head of the order survives that: the first 5 cases at every offset still leave the
+  byte at `0x00`, `0x01`, `0x7F`, `0x80`, `0xFF`, and all 8 single-bit flips still land
+  within the first 13.
 - Sweep order: breadth-first is the default and the first 10 cases of a 10-offset frame
   touch all 10 offsets, each applying `0x00`; a budget of 105 reaches every offset where
-  depth-first reaches one; `FUZZ_SWEEP_DEPTH_FIRST=1` puts the first 268 cases at offset 0
-  and `=0` does not; both orders sweep exactly 2680 cases with no duplicates and cover the
+  depth-first reaches one; `FUZZ_SWEEP_DEPTH_FIRST=1` puts the first 255 cases at offset 0
+  and `=0` does not; both orders sweep exactly 2550 cases with no duplicates and cover the
   **identical** case space in a different sequence; `order` is reported on every `progress`
   and `fuzz` message; and case 300 is a different mutation under each order but replays
   identically within one.
@@ -435,9 +472,9 @@ python3 claude/sweep_ordering/verify_ordering.py .             # 19 checks: swee
 - `FUZZ_HOLD_<TARGET>`: 5000 held frames are byte-identical to the frame as built, all
   5000 announce `progress` with `"state":"held"`, `case_id` never moves off `-9`, and no
   `fuzz` message is emitted. Holding one target leaves another sweeping; `…=0` is not a
-  hold; with nothing held, behaviour is byte-identical to before the change (2680 cases for
-  a 34-byte frame, zero duplicates, 268 per offset, 5/8/255 per kind, masks 1..255, lowest
-  mutated byte 24, locking at `case_max`). A target held at `FUZZ_START_EAPOL=500` parks at
+  hold; with nothing held, behaviour is byte-identical to before the change (2550 cases for
+  a 34-byte frame, zero duplicates, 255 per offset, masks 1..255, lowest mutated byte 24,
+  locking at `case_max`). A target held at `FUZZ_START_EAPOL=500` parks at
   500 rather than at the warm-up. C and Python agree on the `FUZZ_HOLD_` spelling for all
   12 target names.
 - The monitor was driven against a stub emitting the full contract: it warns on `bad_env`,
