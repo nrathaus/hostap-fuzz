@@ -919,7 +919,7 @@ static int send_auth_reply(struct hostapd_data *hapd, struct sta_info *sta,
 {
 	struct ieee80211_mgmt *reply;
 	u8 *buf;
-	size_t rlen;
+	size_t rlen, capacity;
 	int reply_res = WLAN_STATUS_UNSPECIFIED_FAILURE;
 	const u8 *sa = hapd->own_addr;
 	struct wpabuf *ml_resp = NULL;
@@ -960,7 +960,12 @@ static int send_auth_reply(struct hostapd_data *hapd, struct sta_info *sta,
 	}
 #endif /* CONFIG_IEEE8021X_AUTH */
 
-	buf = os_zalloc(rlen);
+	/* Spare room beyond the frame, so the length is something the sweep can
+	 * move. FUZZ_HEADROOM is 0 without CONFIG_FUZZ, so a stock build
+	 * allocates exactly what it did. */
+	capacity = rlen + FUZZ_HEADROOM;
+
+	buf = os_zalloc(capacity);
 	if (!buf) {
 		wpabuf_free(ml_resp);
 		return -1;
@@ -1090,7 +1095,18 @@ static int send_auth_reply(struct hostapd_data *hapd, struct sta_info *sta,
 
 #endif /* CONFIG_IEEE8021X_AUTH */
 
-	apply_mutation(dbg, FUZZ_TYPE_IEEE80211_MGMT, (u8 *) reply, rlen);
+	/* The length the sweep chose, which may differ from the one built, and
+	 * where the element chain starts so that elements can be synthesised
+	 * into it. The variable part of an Authentication frame is an element
+	 * chain for some (algorithm, transaction) combinations and begins with
+	 * fixed fields for others; the hook walks it and falls back to
+	 * appending when it is not a chain, rather than guessing.
+	 *
+	 * Without CONFIG_FUZZ this returns rlen unchanged and compiles away. */
+	rlen = apply_mutation_elements(dbg, FUZZ_TYPE_IEEE80211_MGMT,
+				       (u8 *) reply, rlen, capacity,
+				       IEEE80211_HDRLEN +
+				       sizeof(reply->u.auth));
 
 	if (hostapd_drv_send_mlme(hapd, reply, rlen, 0, NULL, 0, 0) < 0)
 		wpa_printf(MSG_INFO, "send_auth_reply: send failed");
@@ -2561,7 +2577,15 @@ static void handle_auth_sae(struct hostapd_data *hapd, struct sta_info *sta,
 				goto reply;
 		}
 
-		if (!token && use_anti_clogging(hapd) && !allow_reuse) {
+		/* A station that has been sent a comeback request supplies the
+		 * token on its next attempt, so this branch fires once per
+		 * peer and the frame it builds gets one case per session. The
+		 * repeat guard is OR-ed in rather than replacing the condition,
+		 * so the ordinary decision is untouched and the extra
+		 * occurrences are bounded by the peer's budget. No-op unless
+		 * FUZZ_REPEAT_SAE_COMEBACK is set. */
+		if ((!token && use_anti_clogging(hapd) && !allow_reuse) ||
+		    fuzz_stage_repeat("sae-comeback", sta->addr)) {
 			int h2e = 0;
 
 			wpa_printf(MSG_DEBUG,

@@ -30,6 +30,7 @@
 #include "wnm_sta.h"
 #include "notify.h"
 #include "common/ieee802_11_defs.h"
+#include "common/fuzz.h"
 #include "common/ieee802_11_common.h"
 #include "common/gas_server.h"
 #include "common/dpp.h"
@@ -363,6 +364,11 @@ void wpas_reset_mlo_info(struct wpa_supplicant *wpa_s)
 void wpa_supplicant_mark_disassoc(struct wpa_supplicant *wpa_s)
 {
 	int bssid_changed;
+
+	/* The session with this AP is over, so its stage budgets are too --
+	 * otherwise a reconnection inherits a spent budget and the pinned
+	 * behaviour fuzz_stage_repeat() exists to lift comes back silently. */
+	fuzz_peer_reset(wpa_s->bssid);
 
 	wnm_bss_keep_alive_deinit(wpa_s);
 

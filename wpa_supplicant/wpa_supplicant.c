@@ -40,6 +40,7 @@
 #include "common/wpa_ctrl.h"
 #include "common/ieee802_11_common.h"
 #include "common/ieee802_11_defs.h"
+#include "common/fuzz.h"
 #include "common/hw_features_common.h"
 #include "common/gas_server.h"
 #include "common/dpp.h"
@@ -1166,6 +1167,59 @@ static void wpas_verify_ssid_beacon_prot(struct wpa_supplicant *wpa_s)
  * This function is called whenever the connection state changes, e.g.,
  * association is completed for WPA/WPA2 4-Way Handshake is started.
  */
+#ifdef CONFIG_FUZZ
+
+/*
+ * Cycle the association once it completes, so the next session sends the next
+ * fuzz case.
+ *
+ * The station needs this more than the AP does. One session sends one
+ * Authentication frame per transaction, one Association Request and two
+ * EAPOL-Key frames -- about one case per target -- and then stays connected
+ * for as long as the run lasts. Without this, a run of any length covers four
+ * cases, and the first nine per target are the warm-up, so it covers none.
+ *
+ * Deliberately not conditional on how the session ended. A session that
+ * failed is as good a source of the next case as one that succeeded, and
+ * reconnecting only after success would quietly stop the sweep at the first
+ * mutation the AP refused -- which is to say, at the first interesting one.
+ *
+ * FUZZ_RECONNECT_MS <= 0 leaves the station connected, which is what you want
+ * when fuzzing anything past the handshake. This mirrors FUZZ_DISCONNECT_MS
+ * on the AP side.
+ */
+static void fuzz_force_reconnect(void *eloop_ctx, void *timeout_ctx)
+{
+	struct wpa_supplicant *wpa_s = eloop_ctx;
+
+	wpa_printf(MSG_INFO, "[fuzz] {\"msg\":\"reconnect\"}");
+	wpa_supplicant_deauthenticate(wpa_s, WLAN_REASON_DEAUTH_LEAVING);
+	/* deauthenticate() sets wpa_s->disconnected, which would keep the
+	 * station down for good; this is what clears it and asks for the
+	 * next attempt. */
+	wpas_request_connection(wpa_s);
+}
+
+
+static void fuzz_schedule_reconnect(struct wpa_supplicant *wpa_s)
+{
+	int delay_ms;
+
+	if (!fuzz_enabled())
+		return;
+
+	delay_ms = fuzz_env_int("FUZZ_RECONNECT_MS", 1000);
+	if (delay_ms <= 0)
+		return;
+
+	eloop_cancel_timeout(fuzz_force_reconnect, wpa_s, NULL);
+	eloop_register_timeout(delay_ms / 1000, (delay_ms % 1000) * 1000,
+			       fuzz_force_reconnect, wpa_s, NULL);
+}
+
+#endif /* CONFIG_FUZZ */
+
+
 void wpa_supplicant_set_state(struct wpa_supplicant *wpa_s,
 			      enum wpa_states state)
 {
@@ -1242,6 +1296,11 @@ void wpa_supplicant_set_state(struct wpa_supplicant *wpa_s,
 
 	if (state != WPA_SCANNING)
 		wpa_supplicant_notify_scanning(wpa_s, 0);
+
+#ifdef CONFIG_FUZZ
+	if (state == WPA_COMPLETED)
+		fuzz_schedule_reconnect(wpa_s);
+#endif /* CONFIG_FUZZ */
 
 	if (state == WPA_COMPLETED && wpa_s->new_connection) {
 		struct wpa_ssid *ssid = wpa_s->current_ssid;

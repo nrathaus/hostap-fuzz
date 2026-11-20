@@ -19,6 +19,7 @@
 #include "crypto/sha384.h"
 #include "crypto/sha512.h"
 #include "common/ieee802_11_defs.h"
+#include "common/fuzz.h"
 #include "common/ieee802_11_common.h"
 #include "common/ocv.h"
 #include "common/dpp.h"
@@ -119,6 +120,19 @@ int wpa_eapol_key_send(struct wpa_sm *sm, struct wpa_ptk *ptk,
 		}
 	}
 
+	/* The supplicant's own EAPOL-Key frames -- message 2 and 4 of the
+	 * four-way handshake, and the group handshake's reply -- which travel
+	 * station to AP and so are read by a different set of parsers than
+	 * anything src/ap transmits.
+	 *
+	 * Mutated before the MIC below, so that the AP MICs the frame it was
+	 * sent; mutating afterwards gets it dropped on MIC failure before any
+	 * field is parsed. The hexdump is held back until the frame is final,
+	 * because the FILS branch below replaces the buffer outright. */
+	fuzz_peer_hint(dest);
+	apply_mutation_defer_log("sta-eapol", FUZZ_TYPE_IEEE802_1X_HDR,
+				 msg, msg_len);
+
 	if (mic_len) {
 		if (key_mic && (!ptk || !ptk->kck_len))
 			goto out;
@@ -203,6 +217,7 @@ int wpa_eapol_key_send(struct wpa_sm *sm, struct wpa_ptk *ptk,
 	}
 
 	wpa_hexdump(MSG_MSGDUMP, "WPA: TX EAPOL-Key", msg, msg_len);
+	fuzz_log_sent_frame(msg, msg_len);
 	ret = wpa_sm_ether_send(sm, dest, proto, msg, msg_len);
 	eapol_sm_notify_tx_eapol_key(sm->eapol);
 out:

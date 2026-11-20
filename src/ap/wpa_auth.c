@@ -2333,6 +2333,11 @@ void __wpa_send_eapol(struct wpa_authenticator *wpa_auth,
 	 * mutating afterwards makes the supplicant drop it on MIC failure before
 	 * any field is parsed. The hexdump is held back until the frame is
 	 * final, so the log shows the bytes actually transmitted. */
+	/* An EAPOL-Key body carries no address: the addressing is in the
+	 * ethernet header added below here. With several stations in flight
+	 * at once the record has to say which one this case went to, so the
+	 * call site says. */
+	fuzz_peer_hint(wpa_auth_get_spa(sm));
 	apply_mutation_defer_log("eapol", FUZZ_TYPE_IEEE802_1X_HDR, (u8 *) hdr,
 				 len);
 
@@ -3105,6 +3110,15 @@ SM_STATE(WPA_PTK, PTKSTART)
 		key_info |= WPA_KEY_INFO_SECURE;
 	wpa_send_eapol(sm->wpa_auth, sm, key_info, NULL,
 		       sm->ANonce, kde_len ? buf : NULL, kde_len, 0, 0);
+	/* The state machine enters PTKSTART once per session, so the sweep
+	 * sees one case of this frame per session no matter how long the run
+	 * is. How many times it occurs is a domain of its own and this is the
+	 * only place it can be moved. No-op unless FUZZ_REPEAT_EAPOL_M1 is
+	 * set, and bounded by the budget rather than by the loop. */
+	while (fuzz_stage_repeat("eapol-m1", sm->addr))
+		wpa_send_eapol(sm->wpa_auth, sm, key_info, NULL,
+			       sm->ANonce, kde_len ? buf : NULL, kde_len,
+			       0, 0);
 	os_free(buf);
 }
 
@@ -5455,6 +5469,15 @@ SM_STATE(WPA_PTK, PTKINITNEGOTIATING)
 		       WPA_KEY_INFO_ACK | WPA_KEY_INFO_INSTALL |
 		       WPA_KEY_INFO_KEY_TYPE,
 		       _rsc, sm->ANonce, kde, pos - kde, 0, encr);
+	while (fuzz_stage_repeat("eapol-m3", sm->addr))
+		wpa_send_eapol(sm->wpa_auth, sm,
+			       (secure ? WPA_KEY_INFO_SECURE : 0) |
+			       (wpa_mic_len(sm->wpa_key_mgmt, sm->pmk_len,
+					    sm->hash_alg, sm->pasn_group) ?
+				WPA_KEY_INFO_MIC : 0) |
+			       WPA_KEY_INFO_ACK | WPA_KEY_INFO_INSTALL |
+			       WPA_KEY_INFO_KEY_TYPE,
+			       _rsc, sm->ANonce, kde, pos - kde, 0, encr);
 done:
 	bin_clear_free(kde, kde_len);
 	os_free(wpa_ie_buf);
@@ -5900,6 +5923,15 @@ SM_STATE(WPA_PTK_GROUP, REKEYNEGOTIATING)
 		       WPA_KEY_INFO_ACK |
 		       (!sm->Pair ? WPA_KEY_INFO_INSTALL : 0),
 		       rsc, NULL, kde, kde_len, gsm->GN, 1);
+	while (fuzz_stage_repeat("group-m1", sm->addr))
+		wpa_send_eapol(sm->wpa_auth, sm,
+			       WPA_KEY_INFO_SECURE |
+			       (wpa_mic_len(sm->wpa_key_mgmt, sm->pmk_len,
+					    sm->hash_alg, sm->pasn_group) ?
+				WPA_KEY_INFO_MIC : 0) |
+			       WPA_KEY_INFO_ACK |
+			       (!sm->Pair ? WPA_KEY_INFO_INSTALL : 0),
+			       rsc, NULL, kde, kde_len, gsm->GN, 1);
 
 	bin_clear_free(kde_buf, kde_len);
 }

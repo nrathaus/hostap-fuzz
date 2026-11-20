@@ -965,6 +965,23 @@ LIBS += -ldl -rdynamic
 endif
 endif
 
+# The fuzzing hooks. These sit on wpa_supplicant's own transmit paths -- SME
+# authentication, the EAPOL-Key supplicant replies, mesh peering -- none of
+# which are behind CONFIG_AP, so this cannot live inside that block.
+ifdef CONFIG_FUZZ
+L_CFLAGS += -DCONFIG_FUZZ
+# Mark the build so `wpa_supplicant -v` can be checked from a Dockerfile
+# or CI.
+# VERSION_STR_POSTFIX is already set above, so replace it rather than
+# redefining it on the command line.
+L_CFLAGS += -UVERSION_STR_POSTFIX
+L_CFLAGS += -DVERSION_STR_POSTFIX=\"-$(PLATFORM_VERSION)-fuzz\"
+OBJS += src/common/fuzz.c
+# fuzz.c reports through the JSON helpers, which pull in base64
+NEED_JSON=y
+NEED_BASE64=y
+endif
+
 ifdef CONFIG_AP
 NEED_EAP_COMMON=y
 NEED_RSN_AUTHENTICATOR=y
@@ -988,18 +1005,6 @@ OBJS += src/ap/ieee802_11_shared.c
 OBJS += src/ap/drv_callbacks.c
 OBJS += src/ap/ap_drv_ops.c
 OBJS += src/ap/beacon.c
-ifdef CONFIG_FUZZ
-L_CFLAGS += -DCONFIG_FUZZ
-# Mark the build so `hostapd -v` can be checked from a Dockerfile or CI.
-# VERSION_STR_POSTFIX is already set above, so replace it rather than
-# redefining it on the command line.
-L_CFLAGS += -UVERSION_STR_POSTFIX
-L_CFLAGS += -DVERSION_STR_POSTFIX=\"-$(PLATFORM_VERSION)-fuzz\"
-OBJS += src/common/fuzz.c
-# fuzz.c reports through the JSON helpers, which pull in base64
-NEED_JSON=y
-NEED_BASE64=y
-endif
 OBJS += src/ap/bss_load.c
 OBJS += src/ap/eap_user_db.c
 OBJS += src/ap/neighbor_db.c

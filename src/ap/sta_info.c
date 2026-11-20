@@ -11,6 +11,7 @@
 #include "utils/common.h"
 #include "utils/eloop.h"
 #include "common/ieee802_11_defs.h"
+#include "common/fuzz.h"
 #include "common/wpa_ctrl.h"
 #include "common/sae.h"
 #include "common/dpp.h"
@@ -286,6 +287,14 @@ void ap_free_sta(struct hostapd_data *hapd, struct sta_info *sta)
 #endif /* CONFIG_NO_VLAN */
 	int set_beacon = 0;
 	bool remove = true;
+
+	/* The session is over, so this peer's stage budgets go with it.
+	 * Without this a station that reconnects -- which against a real one
+	 * is continuous -- would find its budget already spent, and every
+	 * session after the first would deliver each stage exactly once: the
+	 * pinned behaviour fuzz_stage_repeat() exists to lift, reappearing
+	 * silently. Compiles away without CONFIG_FUZZ. */
+	fuzz_peer_reset(sta->addr);
 
 	accounting_sta_stop(hapd, sta);
 

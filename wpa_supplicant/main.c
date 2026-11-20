@@ -318,6 +318,16 @@ int main(int argc, char *argv[])
 #endif /* CONFIG_CTRL_IFACE_DBUS_NEW */
 		case 'v':
 			printf("%s\n", wpa_supplicant_version);
+			/* Same warning hostapd's show_version() prints, for
+			 * the same reason: a binary that mutates the frames
+			 * it sends must be identifiable from the outside,
+			 * including from a Dockerfile or CI step that only
+			 * runs -v. */
+#ifdef CONFIG_FUZZ
+			printf("Frame fuzzing hooks are COMPILED IN: this build mutates the\n"
+			       "frames it transmits and must not be used as a real station.\n"
+			       "Set FUZZ_DISABLE=1 to run it unmodified.\n");
+#endif /* CONFIG_FUZZ */
 			exitcode = 0;
 			goto out;
 		case 'W':

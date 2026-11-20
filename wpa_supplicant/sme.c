@@ -15,6 +15,7 @@
 #include "common/ieee802_11_defs.h"
 #include "common/ieee802_11_common.h"
 #include "common/ocv.h"
+#include "common/fuzz.h"
 #include "common/ptksa_cache.h"
 #include "crypto/crypto.h"
 #include "eapol_supp/eapol_supp_sm.h"
@@ -1859,6 +1860,28 @@ fail:
 #endif /* CONFIG_ENC_ASSOC */
 
 
+/*
+ * Mutate the algorithm-specific body of an Authentication frame the driver is
+ * about to wrap in an 802.11 header, and return how many octets of it to send.
+ * 'capacity' is the whole allocation behind the body, so the length and
+ * element domains get whatever the builder left spare.
+ *
+ * Offset zero is where an element chain would begin. For the algorithms whose
+ * body starts with fixed fields instead -- an SAE scalar's octets parse as
+ * perfectly plausible elements -- the engine refuses the partial walk and
+ * falls back to appending at the end, rather than inserting at an offset it
+ * arrived at by misreading what was there.
+ *
+ * Without CONFIG_FUZZ this returns the length it was given and compiles away.
+ */
+static size_t sme_fuzz_auth_body(const char *target, u8 *body, size_t len,
+				 size_t capacity)
+{
+	return apply_mutation_elements(target, FUZZ_TYPE_FRAME_BODY, body, len,
+				       capacity, 0);
+}
+
+
 static void sme_send_authentication(struct wpa_supplicant *wpa_s,
 				    struct wpa_bss *bss, struct wpa_ssid *ssid,
 				    int start)
@@ -2724,6 +2747,71 @@ no_fils:
 		return;
 	}
 
+	/*
+	 * The station's own Authentication frame, mutated before it is handed
+	 * to the driver. This is the inverted direction: every hook in src/ap
+	 * points AP to station, which leaves the AP's own parsers reachable by
+	 * nothing.
+	 *
+	 * It happens before the transcript below rather than after, so that
+	 * what the station records is what the station sent. Mutating
+	 * afterwards would leave the two sides computing over different bytes
+	 * and the exchange would fail at the first integrity check, which is
+	 * shallower than this is trying to reach.
+	 */
+	if (resp && params.auth_data == wpabuf_head(resp)) {
+		u8 *body = wpabuf_mhead_u8(resp);
+		size_t cap = wpabuf_size(resp);
+		size_t n = params.auth_data_len;
+
+		switch (params.auth_alg) {
+#ifdef CONFIG_SAE
+		case WPA_AUTH_ALG_SAE:
+			/* Commit and confirm are separate targets: they are
+			 * read by different code on the far side, and sharing
+			 * one case counter would mean each spends the other's
+			 * cases. */
+			n = start ?
+				sme_fuzz_auth_body("sta-auth-sae-commit",
+						   body, n, cap) :
+				sme_fuzz_auth_body("sta-auth-sae-confirm",
+						   body, n, cap);
+			break;
+#endif /* CONFIG_SAE */
+#ifdef CONFIG_FILS
+		case WPA_AUTH_ALG_FILS:
+		case WPA_AUTH_ALG_FILS_SK_PFS:
+			n = sme_fuzz_auth_body("sta-auth-fils", body, n, cap);
+			break;
+#endif /* CONFIG_FILS */
+#ifdef CONFIG_ENC_ASSOC
+		case WPA_AUTH_ALG_EPPKE:
+			/* Written out rather than selected with a ternary so
+			 * that both labels are literals at the call site --
+			 * that is what makes fuzzing/ledger/targets.py able to find
+			 * them without being taught about this function. */
+			n = start ?
+				sme_fuzz_auth_body("sta-auth-eppke-1",
+						   body, n, cap) :
+				sme_fuzz_auth_body("sta-auth-eppke-3",
+						   body, n, cap);
+			break;
+#endif /* CONFIG_ENC_ASSOC */
+#ifdef CONFIG_IEEE8021X_AUTH
+		case WPA_AUTH_ALG_802_1X:
+			n = sme_fuzz_auth_body("sta-auth-8021x", body, n, cap);
+			break;
+#endif /* CONFIG_IEEE8021X_AUTH */
+		default:
+			/* An algorithm added upstream still carries a body
+			 * here, and a run that cannot name it should still
+			 * send it rather than silently skip the frame. */
+			n = sme_fuzz_auth_body("sta-auth", body, n, cap);
+			break;
+		}
+		params.auth_data_len = n;
+	}
+
 #ifdef CONFIG_IEEE8021X_AUTH
 	if (wpa_s->auth_1x &&
 	    sme_add_to_auth_transcript(wpa_s, params.auth_data,
@@ -2877,6 +2965,30 @@ static void wpa_auth_ml_ie(struct wpabuf *buf, const u8 *mld_addr)
 	wpabuf_put_data(buf, mld_addr, ETH_ALEN);
 }
 
+
+/*
+ * Mutate a built Authentication frame in place and return how many octets to
+ * send. The wpabuf's tail room is what the length and element domains have to
+ * work with, so a site that wants them allocates FUZZ_HEADROOM beyond what it
+ * fills; one that does not still gets the octet domain.
+ *
+ * This is the station's own transmit path. The AP hooks mutate frames
+ * travelling AP to station, which leaves every parser on the AP side
+ * unreachable -- not because it is hard to reach, but because nothing was
+ * pointed at it.
+ *
+ * Without CONFIG_FUZZ apply_mutation_elements() returns the length it was
+ * given, so this folds to wpabuf_len() and the callers are unchanged.
+ */
+static size_t sme_fuzz_auth_frame(const char *target, struct wpabuf *buf)
+{
+	return apply_mutation_elements(target, FUZZ_TYPE_IEEE80211_MGMT,
+				       wpabuf_mhead_u8(buf), wpabuf_len(buf),
+				       wpabuf_len(buf) + wpabuf_tailroom(buf),
+				       offsetof(struct ieee80211_mgmt,
+						u.auth.variable));
+}
+
 #endif /* CONFIG_SAE || CONFIG_IEEE8021X_AUTH */
 
 
@@ -2920,6 +3032,7 @@ static int sme_external_auth_send_sae_commit(struct wpa_supplicant *wpa_s,
 	int use_pt;
 	bool use_pk;
 	u16 status;
+	size_t len;
 
 	resp = sme_auth_build_sae_commit(wpa_s, ssid, bssid,
 					 wpa_s->sme.ext_ml_auth ?
@@ -2933,7 +3046,7 @@ static int sme_external_auth_send_sae_commit(struct wpa_supplicant *wpa_s,
 	wpa_s->sme.sae.state = SAE_COMMITTED;
 	buf = wpabuf_alloc(4 + SAE_COMMIT_MAX_LEN + wpabuf_len(resp) +
 			   (wpa_s->sme.ext_ml_auth ? WPA_AUTH_FRAME_ML_IE_LEN :
-			    0));
+			    0) + FUZZ_HEADROOM);
 	if (!buf) {
 		wpabuf_free(resp);
 		return -1;
@@ -2952,7 +3065,8 @@ static int sme_external_auth_send_sae_commit(struct wpa_supplicant *wpa_s,
 				    wpa_s->sme.seq_num, status,
 				    wpa_s->sme.ext_ml_auth ?
 				    wpa_s->own_addr : NULL);
-	wpa_drv_send_mlme(wpa_s, wpabuf_head(buf), wpabuf_len(buf), 1,
+	len = sme_fuzz_auth_frame("sta-ext-sae-commit", buf);
+	wpa_drv_send_mlme(wpa_s, wpabuf_head(buf), len, 1,
 			  wpa_s->sme.ext_auth_freq, 0);
 	wpabuf_free(resp);
 	wpabuf_free(buf);
@@ -3048,6 +3162,7 @@ static void sme_external_auth_send_sae_confirm(struct wpa_supplicant *wpa_s,
 					       const u8 *da)
 {
 	struct wpabuf *resp, *buf;
+	size_t len;
 
 	resp = sme_auth_build_sae_confirm(wpa_s, 1);
 	if (!resp) {
@@ -3058,7 +3173,7 @@ static void sme_external_auth_send_sae_confirm(struct wpa_supplicant *wpa_s,
 	wpa_s->sme.sae.state = SAE_CONFIRMED;
 	buf = wpabuf_alloc(4 + SAE_CONFIRM_MAX_LEN + wpabuf_len(resp) +
 			   (wpa_s->sme.ext_ml_auth ? WPA_AUTH_FRAME_ML_IE_LEN :
-			    0));
+			    0) + FUZZ_HEADROOM);
 	if (!buf) {
 		wpa_printf(MSG_DEBUG, "SAE: Auth Confirm buf alloc failure");
 		wpabuf_free(resp);
@@ -3071,7 +3186,8 @@ static void sme_external_auth_send_sae_confirm(struct wpa_supplicant *wpa_s,
 				    wpa_s->sme.ext_ml_auth ?
 				    wpa_s->own_addr : NULL);
 
-	wpa_drv_send_mlme(wpa_s, wpabuf_head(buf), wpabuf_len(buf), 1,
+	len = sme_fuzz_auth_frame("sta-ext-sae-confirm", buf);
+	wpa_drv_send_mlme(wpa_s, wpabuf_head(buf), len, 1,
 			  wpa_s->sme.ext_auth_freq, 0);
 	wpabuf_free(resp);
 	wpabuf_free(buf);
@@ -3265,6 +3381,9 @@ static int sme_external_auth_send_802_1x(struct wpa_supplicant *wpa_s,
 		wpabuf_len(resp);
 	if (wpa_s->sme.ext_ml_auth)
 		buf_len += WPA_AUTH_FRAME_ML_IE_LEN;
+	/* Room for the frame's length to be a domain of its own. Zero without
+	 * CONFIG_FUZZ, so a stock build allocates exactly what it did. */
+	buf_len += FUZZ_HEADROOM;
 
 	buf = wpabuf_alloc(buf_len);
 	if (!buf)
@@ -3275,7 +3394,8 @@ static int sme_external_auth_send_802_1x(struct wpa_supplicant *wpa_s,
 					   wpa_s->sme.ext_ml_auth ?
 					   wpa_s->own_addr : NULL);
 
-	if (wpa_drv_send_mlme(wpa_s, wpabuf_head(buf), wpabuf_len(buf),
+	if (wpa_drv_send_mlme(wpa_s, wpabuf_head(buf),
+			      sme_fuzz_auth_frame("sta-ext-8021x-auth", buf),
 			      0, 0, 0) < 0) {
 		wpa_printf(MSG_INFO,
 			   "IEEE 802.1X: Failed to send Authentication frame");
@@ -5830,6 +5950,28 @@ mscs_fail:
 		params.freq.freq);
 
 	wpa_supplicant_set_state(wpa_s, WPA_ASSOCIATING);
+
+	/*
+	 * The Association Request's element chain, which on the far side is
+	 * read by the AP's element parser and by everything that parser hands
+	 * an element to. It is mutated here, before the supplicant parses its
+	 * own copy below and before wpa_sm_set_assoc_wpa_ie() records it, so
+	 * that both sides agree on what was sent; mutating after that record
+	 * would get the four-way handshake refused on an RSNE mismatch and
+	 * nothing past it would ever run.
+	 *
+	 * 1500 octets of assoc_req_ie back a chain that is usually a couple of
+	 * hundred, so the length and element domains have real room here.
+	 */
+	if (params.wpa_ie == wpa_s->sme.assoc_req_ie && params.wpa_ie_len) {
+		params.wpa_ie_len = apply_mutation_elements(
+			"sta-assoc-req", FUZZ_TYPE_FRAME_BODY,
+			wpa_s->sme.assoc_req_ie, params.wpa_ie_len,
+			sizeof(wpa_s->sme.assoc_req_ie), 0);
+		/* Keep the supplicant's own length in step with the frame, so
+		 * a later reader of assoc_req_ie_len sees what was sent. */
+		wpa_s->sme.assoc_req_ie_len = params.wpa_ie_len;
+	}
 
 	if (params.wpa_ie == NULL ||
 	    ieee802_11_parse_elems(params.wpa_ie, params.wpa_ie_len, &elems, 0)

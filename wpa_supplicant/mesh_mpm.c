@@ -11,6 +11,7 @@
 #include "utils/common.h"
 #include "utils/eloop.h"
 #include "common/ieee802_11_defs.h"
+#include "common/fuzz.h"
 #include "common/hw_features_common.h"
 #include "common/ocv.h"
 #include "ap/hostapd.h"
@@ -219,7 +220,7 @@ static void mesh_mpm_send_plink_action(struct wpa_supplicant *wpa_s,
 	u8 ie_len, add_plid = 0;
 	int ret;
 	int ampe = conf->security & MESH_CONF_SEC_AMPE;
-	size_t buf_len;
+	size_t buf_len, len, chain_off;
 
 	if (!sta)
 		return;
@@ -271,6 +272,10 @@ static void mesh_mpm_send_plink_action(struct wpa_supplicant *wpa_s,
 		buf_len += 3 + sizeof(struct ieee80211_eht_operation);
 }
 #endif /* CONFIG_IEEE80211BE */
+
+	/* Room for the frame's length to be a domain of its own rather than a
+	 * constant. Zero without CONFIG_FUZZ. */
+	buf_len += FUZZ_HEADROOM;
 
 	buf = wpabuf_alloc(buf_len);
 	if (!buf)
@@ -429,10 +434,46 @@ static void mesh_mpm_send_plink_action(struct wpa_supplicant *wpa_s,
 	}
 #endif /* CONFIG_IEEE80211BE */
 
-	if (ampe && mesh_rsn_protect_frame(wpa_s->mesh_rsn, sta, cat, buf)) {
-		wpa_msg(wpa_s, MSG_INFO,
-			"Mesh MPM: failed to add AMPE and MIC IE");
-		goto fail;
+	/*
+	 * Where this body's element chain begins, mirroring what was built
+	 * above: Category and Action always, then the fixed fields that only
+	 * some peering frames carry.
+	 */
+	chain_off = 2;
+	if (type != PLINK_CLOSE) {
+		chain_off += 2;                  /* capability info */
+		if (type == PLINK_CONFIRM)
+			chain_off += 2;          /* AID */
+	}
+	len = wpabuf_len(buf);
+
+	/*
+	 * Mesh peering is the third transmit direction, after AP to station
+	 * and station to AP: both ends of it are peers running this same code,
+	 * and nothing in the harness pointed at it until now.
+	 *
+	 * A secured mesh MICs this body, so the mutation has to happen before
+	 * mesh_rsn_protect_frame() -- and at a fixed length, because that
+	 * function is still appending to the wpabuf. An unsecured mesh has no
+	 * such constraint and gets the length and element domains as well.
+	 * They are separate targets because they reach differently, and one
+	 * label over both would hide which of the two a run actually had.
+	 */
+	if (ampe) {
+		apply_mutation("mesh-plink-ampe", FUZZ_TYPE_FRAME_BODY,
+			       wpabuf_mhead_u8(buf), len);
+
+		if (mesh_rsn_protect_frame(wpa_s->mesh_rsn, sta, cat, buf)) {
+			wpa_msg(wpa_s, MSG_INFO,
+				"Mesh MPM: failed to add AMPE and MIC IE");
+			goto fail;
+		}
+		len = wpabuf_len(buf);
+	} else {
+		len = apply_mutation_elements("mesh-plink",
+					      FUZZ_TYPE_FRAME_BODY,
+					      wpabuf_mhead_u8(buf), len,
+					      wpabuf_size(buf), chain_off);
 	}
 
 	wpa_msg(wpa_s, MSG_DEBUG, "Mesh MPM: Sending peering frame type %d to "
@@ -440,7 +481,7 @@ static void mesh_mpm_send_plink_action(struct wpa_supplicant *wpa_s,
 		type, MAC2STR(sta->addr), sta->my_lid, sta->peer_lid);
 	ret = wpa_drv_send_action(wpa_s, wpa_s->assoc_freq, 0,
 				  sta->addr, wpa_s->own_addr, wpa_s->own_addr,
-				  wpabuf_head(buf), wpabuf_len(buf), 0);
+				  wpabuf_head(buf), len, 0);
 	if (ret < 0)
 		wpa_msg(wpa_s, MSG_INFO,
 			"Mesh MPM: failed to send peering frame");
@@ -1438,4 +1479,9 @@ void mesh_mpm_free_sta(struct hostapd_data *hapd, struct sta_info *sta)
 	}
 	eloop_cancel_timeout(plink_timer, ELOOP_ALL_CTX, sta);
 	eloop_cancel_timeout(mesh_auth_timer, ELOOP_ALL_CTX, sta);
+
+	/* This peer's stage budgets go with it, so a peer that comes back
+	 * starts over instead of inheriting a spent one. Compiles away
+	 * without CONFIG_FUZZ. */
+	fuzz_peer_reset(sta->addr);
 }

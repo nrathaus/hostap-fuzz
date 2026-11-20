@@ -1050,14 +1050,12 @@ LIBS += -ldl -rdynamic
 endif
 endif
 
-ifdef CONFIG_AP
-NEED_EAP_COMMON=y
-NEED_RSN_AUTHENTICATOR=y
-CFLAGS += -DCONFIG_AP
-OBJS += ap.o
+# The fuzzing hooks. These sit on wpa_supplicant's own transmit paths -- SME
+# authentication, the EAPOL-Key supplicant replies, mesh peering -- none of
+# which are behind CONFIG_AP, so this cannot live inside that block.
 ifdef CONFIG_FUZZ
 CFLAGS += -DCONFIG_FUZZ
-# Mark the build so `hostapd -v` can be checked from a Dockerfile or CI
+# Mark the build so `wpa_supplicant -v` can be checked from a Dockerfile or CI
 CFLAGS += -DVERSION_STR_POSTFIX=\"-fuzz\"
 OBJS += ../src/common/fuzz.o
 # fuzz.c reports through the JSON helpers, which pull in base64
@@ -1065,6 +1063,11 @@ NEED_JSON=y
 NEED_BASE64=y
 endif
 
+ifdef CONFIG_AP
+NEED_EAP_COMMON=y
+NEED_RSN_AUTHENTICATOR=y
+CFLAGS += -DCONFIG_AP
+OBJS += ap.o
 CFLAGS += -DCONFIG_NO_RADIUS
 CFLAGS += -DCONFIG_NO_ACCOUNTING
 CFLAGS += -DCONFIG_NO_VLAN

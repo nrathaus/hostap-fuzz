@@ -1,0 +1,90 @@
+# Build configuration for a fuzzing wpa_supplicant. Copy to
+# wpa_supplicant/.config:
+#
+#   cp defconfig-fuzz .config && make
+#
+# This is defconfig plus what the inverted direction needs. The hostapd one is
+# hostapd/defconfig-fuzz; the two are separate builds and both are needed for
+# the topology where a fuzzing station is pointed at a stock AP.
+#
+# Building with ASan is strongly recommended -- in the station-against-AP
+# topology the *AP* is the victim, so it is the AP that wants the sanitiser,
+# but a fuzzing supplicant that crashes on its own bugs is noise you want to
+# see rather than guess at:
+#
+#   make clean
+#   make CFLAGS="-fsanitize=address -fno-omit-frame-pointer -g -O1" \
+#        LDFLAGS="-fsanitize=address"
+#
+# Checked against wpa_supplicant/defconfig at c0dca31e0.
+
+# The fuzzing hooks themselves. Without this the mutation call sites in
+# wpa_supplicant/ and src/rsn_supp/ compile away and this behaves as a normal
+# station.
+CONFIG_FUZZ=y
+
+CONFIG_DRIVER_NL80211=y
+CONFIG_LIBNL32=y
+
+CONFIG_IEEE80211AC=y
+CONFIG_IEEE80211AX=y
+CONFIG_IEEE80211BE=y
+
+# WPA3-Personal. The station's SAE commit and confirm are two of the four
+# targets this build exists to put on the air.
+CONFIG_SAE=y
+CONFIG_SAE_PK=y
+
+# Mesh peering -- the third transmit direction, and the only one where both
+# ends of the exchange run this same code. Off in upstream defconfig; on here,
+# because without it mesh-plink and mesh-plink-ampe have no call site.
+CONFIG_MESH=y
+
+# AP mode, so one binary can also be the stock side of a two-node topology
+# without a second build. It is NOT what gates the fuzzing hooks: the station
+# and mesh hooks are outside CONFIG_AP, which is why the CONFIG_FUZZ block in
+# the Makefile is outside it too.
+CONFIG_AP=y
+
+CONFIG_IEEE80211R=y
+
+CONFIG_EAP_MD5=y
+CONFIG_EAP_TLS=y
+CONFIG_EAP_MSCHAPV2=y
+CONFIG_EAP_PEAP=y
+CONFIG_EAP_TTLS=y
+CONFIG_EAP_GTC=y
+CONFIG_EAP_OTP=y
+CONFIG_EAP_LEAP=y
+CONFIG_PKCS12=y
+CONFIG_ERP=y
+
+CONFIG_CTRL_IFACE=y
+CONFIG_BACKEND=file
+CONFIG_IPV6=y
+CONFIG_DEBUG_FILE=y
+CONFIG_INTERNAL_LIBTOMMATH=y
+
+# hostap's own fault-injection knobs, same reasoning as the hostapd build:
+# ext_mgmt_frame_handling and ext_eapol_frame_io can drive frames from outside
+# without patching C.
+CONFIG_TESTING_OPTIONS=y
+
+# CONFIG_TESTING_OPTIONS' MGMT_TX control-interface command calls
+# offchannel_send_action(), but nothing in the Makefile makes it pull
+# offchannel.o in. Upstream's own tests/hwsim config does not hit this because
+# it also sets CONFIG_P2P=y, which happens to request it. Ask for it directly
+# rather than enabling a feature for its side effect -- .config is included as
+# a makefile, so an internal NEED_ variable set here reaches the rule.
+NEED_OFFCHANNEL=y
+
+# --------------------------------------------------------------------------
+# Upstream-experimental, off here as upstream has them, but each one adds a
+# station transmit path the hooks above already cover -- turning any of them on
+# widens what a run sends rather than only adding a feature. Expect to be the
+# first to fuzz them.
+#
+#CONFIG_IEEE8021X_AUTH=y   # sta-auth-8021x, sta-ext-8021x-auth
+#CONFIG_ENC_ASSOC=y        # sta-auth-eppke-1, sta-auth-eppke-3
+#CONFIG_PQC=y
+#CONFIG_FILS=y             # sta-auth-fils
