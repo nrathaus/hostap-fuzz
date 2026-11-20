@@ -71,3 +71,20 @@ CONFIG_INTERNAL_LIBTOMMATH=y
 #
 # CONFIG_OWE became a default-on option upstream; it is left at the upstream
 # default rather than being forced here.
+
+# WNM on the AP side: WNM-Sleep Mode Response, BSS Transition Management
+# Request and Collocated Interference Request are frames hostapd builds and
+# transmits, and src/ap/wnm_ap.c carries a mutation hook for each. Without
+# this the hooks compile away and those six transmit paths are unreachable --
+# not under-fuzzed, absent. CONFIG_WNM defines CONFIG_WNM_AP as well.
+#
+# The WNM-Sleep Mode Response is the one worth having: it carries GTK, IGTK
+# and BIGTK subelements whose lengths the receiver parses, which is where the
+# recent upstream subelement length fixes landed.
+CONFIG_WNM=y
+# Operating Channel Validation. The OCI KDE goes into the EAPOL-Key key data
+# and the OCI element into the WNM-Sleep Mode Response -- both frames this
+# tree hooks -- so with the WNM hooks in place this adds content to frames
+# already under mutation rather than frames nothing touches.
+CONFIG_OCV=y
+

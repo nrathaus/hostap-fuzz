@@ -38,6 +38,15 @@ CONFIG_SAE_PK=y
 # Mesh peering -- the third transmit direction, and the only one where both
 # ends of the exchange run this same code. Off in upstream defconfig; on here,
 # because without it mesh-plink and mesh-plink-ampe have no call site.
+# WNM on the station side. The AP's WNM-Sleep Mode Response and its answer to
+# a BSS Transition Management Query are transmit paths hostapd only takes when
+# a station asks, so without this the two hooks in src/ap/wnm_ap.c are
+# unreachable in every hwsim topology: the peer cannot ask.
+CONFIG_WNM=y
+# The station has to agree to OCV or the AP does not insert the OCI.
+CONFIG_OCV=y
+
+
 CONFIG_MESH=y
 
 # AP mode, so one binary can also be the stock side of a two-node topology

@@ -492,6 +492,17 @@ def check_monitor(root, check):
     check.ok('"who"' in src,
              "and a repro record says which process died, because in this "
              "direction it is not the one that sent the frame")
+    #  A run whose subject never started reports zero coverage, which is
+    #  indistinguishable from a run that fuzzed nothing interesting. Under
+    #  --quiet the reason was not printed as it went by either, so the tail
+    #  has to be kept.
+    check.ok("saw_fuzz_line" in src,
+             "a subject that emitted no [fuzz] line at all is noticed")
+    check.ok("tail = collections.deque" in src,
+             "and its last output is kept even under --quiet")
+    check.ok("fuzzed nothing" in src,
+             "so an invalid config is reported as a reason, not as zero "
+             "coverage")
     rc = subprocess.run([sys.executable,
                          os.path.join(root, "monitor_fuzzing.py"), "--help"],
                         capture_output=True, text=True)
@@ -561,6 +572,114 @@ def check_no_uncommitted_paths(root, check):
     check.ok(not missing,
              "and every one of them exists%s"
              % ("" if not missing else ": " + ", ".join(missing)))
+
+
+def check_wnm_hooks(root, check):
+    """The WNM transmit paths are hooked, and the build and configs reach them.
+
+    A hook is three things, not one: the call in the transmit path, the build
+    option that compiles it in, and the configuration that makes hostapd take
+    that path at all. Any one of them missing and the target is announced in
+    the inventory and reached zero times -- which reads as "never got there"
+    rather than "cannot get there". All three are checked here."""
+    print("\nThe WNM transmit paths are reachable")
+    src = open(os.path.join(root, "src", "ap", "wnm_ap.c"),
+               encoding="utf-8").read()
+
+    want = ["wnm-sleep-resp", "wnm-bss-tm-req", "wnm-disassoc-imminent",
+            "wnm-ess-disassoc-imminent", "wnm-bss-tm-req-full",
+            "wnm-coloc-intf-req"]
+    for label in want:
+        check.ok('"%s"' % label in src,
+                 "%s is hooked" % label)
+
+    # Every transmit in the file is behind a hook, not just most of them.
+    # Comments are stripped first: the hooks' own comments name the transmit
+    # functions, and counting those would make the check pass by describing
+    # the work rather than by doing it.
+    code = re.sub(r'/\*.*?\*/', '', src, flags=re.S)
+    code = re.sub(r'//[^\n]*', '', code)
+    sends = len(re.findall(r'hostapd_drv_send_mlme\s*\(|'
+                           r'hostapd_drv_send_action\s*\(', code))
+    hooks = len(re.findall(r'apply_mutation[a-z_]*\s*\(', code))
+    check.ok(sends == hooks,
+             "every transmit in wnm_ap.c has one (%d send, %d hook)"
+             % (sends, hooks))
+
+    # The collocated interference frame ends at req_info: claiming an element
+    # chain there would have the engine synthesise elements into a frame with
+    # no place for them.
+    check.ok("apply_mutation_resize(\n\t\t\"wnm-coloc-intf-req" in src or
+             'apply_mutation_resize(' in src,
+             "and the frame with no element chain does not claim one")
+
+    # The build option, both ends.
+    ap = open(os.path.join(root, "hostapd", "defconfig-fuzz"),
+              encoding="utf-8").read()
+    check.ok(re.search(r'^CONFIG_WNM=y', ap, re.M) is not None,
+             "hostapd/defconfig-fuzz compiles the hooks in")
+    sta = open(os.path.join(root, "wpa_supplicant", "defconfig-fuzz"),
+               encoding="utf-8").read()
+    check.ok(re.search(r'^CONFIG_WNM=y', sta, re.M) is not None,
+             "and the station can ask, or two of the six are unreachable in "
+             "every topology")
+
+    # The configuration that makes hostapd willing to answer.
+    conf = open(os.path.join(root, "fuzzing", "topology", "ap-stock.conf"),
+                encoding="utf-8").read()
+    for opt in ("wnm_sleep_mode=1", "bss_transition=1"):
+        check.ok(re.search(r'^%s' % re.escape(opt), conf, re.M) is not None,
+                 "the topology AP sets %s" % opt)
+
+
+def check_handover(root, check):
+    """The reporting tools survive being copied out of the checkout.
+
+    The binary is self-contained -- the generated tables are compiled into it
+    -- so handing someone the binary alone still fuzzes. The reporting around
+    it is what has a source-tree dependency, and the failure used to be a
+    traceback at the end of a finished run: the worst possible moment, because
+    the run is over and the output is gone. Degrading is what makes the binary
+    a thing you can hand over."""
+    print("\nThe reporting survives leaving the checkout")
+    with tempfile.TemporaryDirectory() as tmp:
+        shutil.copy(os.path.join(root, "monitor_fuzzing.py"), tmp)
+        shutil.copytree(os.path.join(root, "fuzzing", "ledger"),
+                        os.path.join(tmp, "fuzzing", "ledger"),
+                        ignore=shutil.ignore_patterns("__pycache__"))
+        log = os.path.join(tmp, "run.log")
+        with open(log, "w", encoding="utf-8") as f:
+            f.write('[fuzz] {"msg":"inventory","targets":["a","b"],'
+                    '"stages":[]}\n')
+            f.write('[fuzz] {"msg":"progress","target":"a"}\n')
+            f.write('[fuzz] {"msg":"fuzz","type":"MUT_BYTE_XOR","target":"a",'
+                    '"frame":"mgmt","case":3,"at":30,"before":1,"after":129,'
+                    '"peer":"02:00:00:00:01:00"}\n')
+        rc = subprocess.run(
+            [sys.executable,
+             os.path.join(tmp, "fuzzing", "ledger", "ledger.py"), tmp, log],
+            capture_output=True, text=True)
+        check.ok(rc.returncode == 0,
+                 "the ledger reports a log with no hostap source beside it")
+        check.ok("Traceback" not in rc.stderr,
+                 "without a traceback")
+        check.ok("1 of 2 reached" in rc.stdout,
+                 "and still says which targets were reached")
+        check.ok("02:00:00:00:01:00" in rc.stdout,
+                 "and which peer received the case")
+        check.ok("No checkout" in rc.stdout,
+                 "while saying the denominators are missing rather than "
+                 "printing them as zero")
+        # A table of zeros would read as "nothing was sent", which is the one
+        # thing it does not mean.
+        check.ok("defined  as built  on air" not in rc.stdout,
+                 "so the denominator table is not printed at all")
+
+        rc = subprocess.run([sys.executable,
+                             os.path.join(tmp, "monitor_fuzzing.py"),
+                             "--help"], capture_output=True, text=True)
+        check.ok(rc.returncode == 0,
+                 "and the monitor runs outside the checkout too")
 
 
 def check_documented_builds(root, check):
@@ -687,6 +806,8 @@ def main():
     check_ledger_path(root, check)
     check_documented_builds(root, check)
     check_no_uncommitted_paths(root, check)
+    check_handover(root, check)
+    check_wnm_hooks(root, check)
     with tempfile.TemporaryDirectory() as tmp:
         binary = build_harness(root, tmp)
         if binary is None:

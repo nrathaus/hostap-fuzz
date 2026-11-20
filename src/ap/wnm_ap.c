@@ -13,6 +13,7 @@
 #include "common/ieee802_11_defs.h"
 #include "common/wpa_ctrl.h"
 #include "common/ocv.h"
+#include "common/fuzz.h"
 #include "ap/hostapd.h"
 #include "ap/sta_info.h"
 #include "ap/ap_config.h"
@@ -66,6 +67,7 @@ static int ieee802_11_send_wnmsleep_resp(struct hostapd_data *hapd,
 	struct ieee80211_mgmt *mgmt;
 	int res;
 	size_t len;
+	size_t mgmt_alloc, mgmt_capacity;
 	size_t gtk_elem_len = 0;
 	size_t igtk_elem_len = 0;
 	size_t bigtk_elem_len = 0;
@@ -148,10 +150,13 @@ static int ieee802_11_send_wnmsleep_resp(struct hostapd_data *hapd,
 #define MAX_GTK_SUBELEM_LEN 45
 #define MAX_IGTK_SUBELEM_LEN 10 + WPA_IGTK_MAX_LEN
 #define MAX_BIGTK_SUBELEM_LEN 10 + WPA_BIGTK_MAX_LEN
-	mgmt = os_zalloc(sizeof(*mgmt) + wnmsleep_ie_len + wnmtfs_ie_len +
-			 MAX_GTK_SUBELEM_LEN + MAX_IGTK_SUBELEM_LEN +
-			 MAX_BIGTK_SUBELEM_LEN +
-			 oci_ie_len);
+	/* FUZZ_HEADROOM is what makes the length and element domains
+	 * reachable here: without spare octets past the frame the sweep can
+	 * only shorten it, never grow it. Zero without CONFIG_FUZZ. */
+	mgmt_alloc = sizeof(*mgmt) + wnmsleep_ie_len + wnmtfs_ie_len +
+		MAX_GTK_SUBELEM_LEN + MAX_IGTK_SUBELEM_LEN +
+		MAX_BIGTK_SUBELEM_LEN + oci_ie_len + FUZZ_HEADROOM;
+	mgmt = os_zalloc(mgmt_alloc);
 	if (mgmt == NULL) {
 		wpa_printf(MSG_DEBUG, "MLME: Failed to allocate buffer for "
 			   "WNM-Sleep Response action frame");
@@ -160,6 +165,12 @@ static int ieee802_11_send_wnmsleep_resp(struct hostapd_data *hapd,
 	}
 
 	own_addr = wnm_ap_get_own_addr(hapd, sta);
+
+	/* What the mutation may grow into: the allocation less the octets
+	 * before the action body, since that is where the frame handed to the
+	 * driver begins. */
+	mgmt_capacity = mgmt_alloc -
+		((u8 *) &mgmt->u.action.category - (u8 *) mgmt);
 
 	os_memcpy(mgmt->da, addr, ETH_ALEN);
 	os_memcpy(mgmt->sa, own_addr, ETH_ALEN);
@@ -219,6 +230,18 @@ static int ieee802_11_send_wnmsleep_resp(struct hostapd_data *hapd,
 	len = 1 + sizeof(mgmt->u.action.u.wnm_sleep_resp) + gtk_elem_len +
 		igtk_elem_len + bigtk_elem_len +
 		wnmsleep_ie_len + wnmtfs_ie_len + oci_ie_len;
+
+	/* The element chain starts after the key data, whose length only this
+	 * function knows: the subelements before it are not elements of the
+	 * chain. hostapd_drv_send_action() is handed the action body and the
+	 * driver supplies the header, so this is a FRAME_BODY and no octets
+	 * are reserved. */
+	len = apply_mutation_elements(
+		"wnm-sleep-resp", FUZZ_TYPE_FRAME_BODY,
+		&mgmt->u.action.category, len, mgmt_capacity,
+		(u8 *) mgmt->u.action.u.wnm_sleep_resp.variable -
+		&mgmt->u.action.category +
+		gtk_elem_len + igtk_elem_len + bigtk_elem_len);
 
 	/* In driver, response frame should be forced to sent when STA is in
 	 * PS mode */
@@ -390,7 +413,7 @@ static int ieee802_11_send_bss_trans_mgmt_request(struct hostapd_data *hapd,
 	u8 *pos;
 	int res;
 
-	mgmt = os_zalloc(sizeof(*mgmt));
+	mgmt = os_zalloc(sizeof(*mgmt) + FUZZ_HEADROOM);
 	if (mgmt == NULL)
 		return -1;
 
@@ -419,6 +442,13 @@ static int ieee802_11_send_bss_trans_mgmt_request(struct hostapd_data *hapd,
 		   mgmt->u.action.u.bss_tm_req.validity_interval);
 
 	len = pos - &mgmt->u.action.category;
+	len = apply_mutation_elements(
+		"wnm-bss-tm-req", FUZZ_TYPE_FRAME_BODY,
+		&mgmt->u.action.category, len,
+		sizeof(*mgmt) + FUZZ_HEADROOM -
+		((u8 *) &mgmt->u.action.category - (u8 *) mgmt),
+		mgmt->u.action.u.bss_tm_req.variable -
+		&mgmt->u.action.category);
 	res = hostapd_drv_send_action(hapd, hapd->iface->freq, 0,
 				      mgmt->da, &mgmt->u.action.category, len);
 	os_free(mgmt);
@@ -844,6 +874,7 @@ int wnm_send_disassoc_imminent(struct hostapd_data *hapd,
 			       struct sta_info *sta, int disassoc_timer)
 {
 	u8 buf[1000], *pos;
+	size_t frame_len;
 	struct ieee80211_mgmt *mgmt;
 	const u8 *own_addr = wnm_ap_get_own_addr(hapd, sta);
 
@@ -867,7 +898,14 @@ int wnm_send_disassoc_imminent(struct hostapd_data *hapd,
 
 	wpa_printf(MSG_DEBUG, "WNM: Send BSS Transition Management Request frame to indicate imminent disassociation (disassoc_timer=%d) to "
 		   MACSTR, disassoc_timer, MAC2STR(sta->addr));
-	if (hostapd_drv_send_mlme(hapd, buf, pos - buf, 0, NULL, 0, 0) < 0) {
+	/* A whole management frame this time: hostapd_drv_send_mlme() is
+	 * handed the header too, so the 24 octets of it are reserved and the
+	 * local buffer is the capacity. */
+	frame_len = apply_mutation_elements(
+		"wnm-disassoc-imminent", FUZZ_TYPE_IEEE80211_MGMT,
+		buf, pos - buf, sizeof(buf),
+		mgmt->u.action.u.bss_tm_req.variable - buf);
+	if (hostapd_drv_send_mlme(hapd, buf, frame_len, 0, NULL, 0, 0) < 0) {
 		wpa_printf(MSG_DEBUG, "Failed to send BSS Transition "
 			   "Management Request frame");
 		return -1;
@@ -911,7 +949,7 @@ int wnm_send_ess_disassoc_imminent(struct hostapd_data *hapd,
 {
 	u8 buf[1000], *pos;
 	struct ieee80211_mgmt *mgmt;
-	size_t url_len;
+	size_t url_len, frame_len;
 	const u8 *own_addr = wnm_ap_get_own_addr(hapd, sta);
 
 	os_memset(buf, 0, sizeof(buf));
@@ -941,7 +979,11 @@ int wnm_send_ess_disassoc_imminent(struct hostapd_data *hapd,
 	os_memcpy(pos, url, url_len);
 	pos += url_len;
 
-	if (hostapd_drv_send_mlme(hapd, buf, pos - buf, 0, NULL, 0, 0) < 0) {
+	frame_len = apply_mutation_elements(
+		"wnm-ess-disassoc-imminent", FUZZ_TYPE_IEEE80211_MGMT,
+		buf, pos - buf, sizeof(buf),
+		mgmt->u.action.u.bss_tm_req.variable - buf);
+	if (hostapd_drv_send_mlme(hapd, buf, frame_len, 0, NULL, 0, 0) < 0) {
 		wpa_printf(MSG_DEBUG, "Failed to send BSS Transition "
 			   "Management Request frame");
 		return -1;
@@ -964,7 +1006,7 @@ int wnm_send_bss_tm_req(struct hostapd_data *hapd, struct sta_info *sta,
 {
 	u8 *buf, *pos;
 	struct ieee80211_mgmt *mgmt;
-	size_t url_len;
+	size_t url_len, buf_len, frame_len;
 	const u8 *own_addr = wnm_ap_get_own_addr(hapd, sta);
 
 	wpa_printf(MSG_DEBUG, "WNM: Send BSS Transition Management Request to "
@@ -972,7 +1014,8 @@ int wnm_send_bss_tm_req(struct hostapd_data *hapd, struct sta_info *sta,
 		   " req_mode=0x%x disassoc_timer=%d valid_int=0x%x dialog_token=%u",
 		   MAC2STR(sta->addr), req_mode, disassoc_timer, valid_int,
 		   dialog_token);
-	buf = os_zalloc(1000 + nei_rep_len + mbo_len);
+	buf_len = 1000 + nei_rep_len + mbo_len + FUZZ_HEADROOM;
+	buf = os_zalloc(buf_len);
 	if (buf == NULL)
 		return -1;
 	mgmt = (struct ieee80211_mgmt *) buf;
@@ -1020,7 +1063,11 @@ int wnm_send_bss_tm_req(struct hostapd_data *hapd, struct sta_info *sta,
 				  mbo_len);
 	}
 
-	if (hostapd_drv_send_mlme(hapd, buf, pos - buf, 0, NULL, 0, 0) < 0) {
+	frame_len = apply_mutation_elements(
+		"wnm-bss-tm-req-full", FUZZ_TYPE_IEEE80211_MGMT,
+		buf, pos - buf, buf_len,
+		mgmt->u.action.u.bss_tm_req.variable - buf);
+	if (hostapd_drv_send_mlme(hapd, buf, frame_len, 0, NULL, 0, 0) < 0) {
 		wpa_printf(MSG_DEBUG,
 			   "Failed to send BSS Transition Management Request frame");
 		os_free(buf);
@@ -1068,6 +1115,7 @@ int wnm_send_coloc_intf_req(struct hostapd_data *hapd, struct sta_info *sta,
 {
 	u8 buf[100], *pos;
 	struct ieee80211_mgmt *mgmt;
+	size_t frame_len;
 	u8 dialog_token = 1;
 	const u8 *own_addr = wnm_ap_get_own_addr(hapd, sta);
 
@@ -1091,7 +1139,14 @@ int wnm_send_coloc_intf_req(struct hostapd_data *hapd, struct sta_info *sta,
 	wpa_printf(MSG_DEBUG, "WNM: Sending Collocated Interference Request to "
 		   MACSTR " (dialog_token=%u auto_report=%u timeout=%u)",
 		   MAC2STR(sta->addr), dialog_token, auto_report, timeout);
-	if (hostapd_drv_send_mlme(hapd, buf, pos - buf, 0, NULL, 0, 0) < 0) {
+	/* This frame has no element chain -- it ends at req_info -- so the
+	 * element domains are not claimed for it. Saying otherwise would have
+	 * the engine synthesise elements into a frame whose format has no
+	 * place for them. */
+	frame_len = apply_mutation_resize(
+		"wnm-coloc-intf-req", FUZZ_TYPE_IEEE80211_MGMT,
+		buf, pos - buf, sizeof(buf));
+	if (hostapd_drv_send_mlme(hapd, buf, frame_len, 0, NULL, 0, 0) < 0) {
 		wpa_printf(MSG_DEBUG,
 			   "WNM: Failed to send Collocated Interference Request frame");
 		return -1;

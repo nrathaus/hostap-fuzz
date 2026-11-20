@@ -221,6 +221,12 @@ static const char * const fuzz_known_targets[] = {
 	"sta-ext-8021x-auth",
 	"sta-ext-sae-commit",
 	"sta-ext-sae-confirm",
+	"wnm-bss-tm-req",
+	"wnm-bss-tm-req-full",
+	"wnm-coloc-intf-req",
+	"wnm-disassoc-imminent",
+	"wnm-ess-disassoc-imminent",
+	"wnm-sleep-resp",
 };
 
 

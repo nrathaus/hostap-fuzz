@@ -401,9 +401,16 @@ class Ledger:
         out = out or sys.stdout
         say = lambda *a: print(*a, file=out)
         defined = registries_mod.extract(root)
+        have_source = any(defined.values())
 
         say("COVERAGE LEDGER -- what this run sent. Not a verdict.")
         say()
+        if not have_source:
+            say("No checkout at %s, so the registry denominators are not" % root)
+            say("available: this report says what the run sent, not out of how")
+            say("many. Point the first argument at a hostap source tree for the")
+            say("'defined members' column.")
+            say()
         say("frames with a hexdump: %d" % self.frames)
         if self.unparsed:
             say("unparsable [fuzz] lines: %d" % self.unparsed)
@@ -537,6 +544,20 @@ class Ledger:
             say("  (no stage inventory: a stage with no repeats cannot be")
             say("   told from one this build does not have)")
             say()
+
+        if not have_source:
+            # Every cell in this section is counted against the number of
+            # members a family has, and without the header that number is 0.
+            # A table of zeros reads as "nothing was sent", which is the one
+            # thing it does not mean, so print the raw counts instead.
+            say("REGISTRIES -- distinct values this run put in each family.")
+            say("No checkout, so there is no denominator to compare them to.")
+            for _, name in registries_mod.REGISTRIES:
+                b = len(self.built.get(name, Tally()).values)
+                a = len(self.air.get(name, Tally()).values)
+                if b or a:
+                    say("  %-24s %5d as built %5d on air" % (name, b, a))
+            return
 
         say("REGISTRIES                    defined members seen    distinct values")
         say("                            defined  as built  on air   as built  on air")

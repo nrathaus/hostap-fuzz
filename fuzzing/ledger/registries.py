@@ -38,9 +38,18 @@ def _value(text):
 
 
 def extract(root):
-    """{report name: {value: [constant names]}}, from the checkout's header."""
+    """{report name: {value: [constant names]}}, from the checkout's header.
+
+    Empty tables when the header is not there. The registries are a
+    denominator -- how many members a family has -- and a denominator is the
+    one part of this report that cannot be recovered from a log. A run handed
+    to someone with the binary and no checkout still has every numerator it
+    recorded, so the report says what was sent and declines to say out of how
+    many, rather than failing and saying nothing."""
     path = os.path.join(root, HEADER)
     out = {name: {} for _, name in REGISTRIES}
+    if not os.path.isfile(path):
+        return out
     with open(path, encoding="utf-8", errors="replace") as f:
         for line in f:
             m = DEFINE_RE.match(line.rstrip("\n"))

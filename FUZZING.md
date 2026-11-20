@@ -162,6 +162,51 @@ python3 -m venv ~/.venv/hostap-fuzz && ~/.venv/hostap-fuzz/bin/pip install scapy
 Under `sudo` this matters: root's bare `python3` will not see a venv in your home
 directory, and every frame comes back as raw hex.
 
+## Handing it to someone else
+
+The binary is self-contained. The element registries and the field table are
+**compiled into it**, so a `hostapd` built here fuzzes on a machine with none of this
+repository on it. What you hand over depends on what you want back.
+
+| you give them | they get | they do not get |
+| --- | --- | --- |
+| the binary + a `.conf` | a working fuzzing AP. Every case printed as a `[fuzz] ` JSON line on stdout | crash detection, repro records, any coverage summary |
+| + `monitor_fuzzing.py` | the subject relaunched and watched, a repro record written when it dies, frames dissected if they have scapy | the coverage tally |
+| + `fuzzing/ledger/` | the full report: targets reached, fields, per-peer split | the registry denominators, unless they also have a hostap source tree |
+| the repository | all of it | |
+
+**The binary alone is a real answer, not a degraded one.** It mutates, it sweeps
+deterministically, and it prints every case as JSON. If they redirect stdout to a file
+and send it back, you can run the ledger over it here and get the whole report, because
+the log is the record and the tooling only reads it.
+
+```sh
+# on their machine
+./hostapd their.conf > run.log 2>&1
+
+# on yours
+python3 fuzzing/ledger/ledger.py . run.log
+```
+
+That round trip is usually the right shape: they need a binary and a config, you keep
+the analysis.
+
+### What travels and what does not
+
+`monitor_fuzzing.py` looks for the ledger at `fuzzing/ledger/ledger.py` **relative to
+itself**, so the two travel together with that directory structure intact, or the monitor
+runs without coverage and says so on stderr.
+
+The ledger reads `src/common/ieee802_11_defs.h` for the registry denominators, which is
+the one thing in the report that cannot come from a log: how many members a family has.
+Without a checkout it reports every numerator it recorded and says the denominators are
+unavailable, rather than printing a table of zeros that would read as "nothing was sent".
+
+Reproducing one of their crashes needs the **same binary**, since a case id only means
+something within one case space. The `opset` on every line (`v2/7d/STRIDE/251@0`) is what
+tells you whether their build and yours agree; if it differs, the same id is a different
+mutation. Send the binary, not the branch name.
+
 ## Topologies
 
 Four scripts, each setting up a whole run in a network namespace of its own.
@@ -831,6 +876,39 @@ one option moved, everything else held, the [coverage ledger](#the-inventory) re
 what reached the air. A family is covered when every member of it has been the setting of
 some run.
 
+### What a config line is worth, measured
+
+Two minutes each, same harness, a fuzzing hostapd against two stock stations. The left
+column is a plain WPA3-SAE config: `hw_mode=g`, no `ieee80211n`, nothing optional.
+
+| | plain | plus five lines |
+| --- | --- | --- |
+| element ids built | **7** of 179 | **13** of 179 |
+| targets reached | 6 of 28 | 6 of 28 |
+
+The five lines are `ieee80211n=1`, `wmm_enabled=1`, `rrm_neighbor_report=1`,
+`rrm_beacon_report=1`, `time_advertisement=2`, and what they add is
+`HT_CAP`, `HT_OPERATION`, `RRM_ENABLED_CAPABILITIES`, `TIME_ADVERTISEMENT`, `TIME_ZONE`
+and the WMM `VENDOR_SPECIFIC`. Nearly double the element surface for five lines.
+
+**The target count did not move**, and that is the point of the distinction. Configuration
+widens what is inside the frames; it does not change which frames get sent. The targets a
+hostapd run never reaches need a different direction or a different protocol, not more
+config: twelve of them are station-side and two are mesh, so no hostapd configuration
+reaches them at all.
+
+`hw_mode` is the single largest one. On `g` there is no VHT, HE or EHT element to mutate,
+which is where the recent upstream out-of-bounds fixes live — `check_valid_he_mcs()`,
+`get_max_nss_capability()`, the Multi-Link parsing. A second profile on `hw_mode=a`,
+`channel=36`, `ieee80211ac=1`, `ieee80211ax=1` is one config change for the largest block
+of surface a 2.4 GHz run cannot have.
+
+Two things that do not work in the hwsim topologies: `country_code` with `ieee80211d=1`
+fails with `Failed to set country code`, because the namespace has no regulatory domain
+(use `fuzzing/live/run_live.sh` on a real adapter for those), and `ocv` and
+`bss_transition` are rejected outright unless the build has `CONFIG_OCV=y` and
+`CONFIG_WNM_AP=y`. Part of the surface is a defconfig change, not a config line.
+
 Which options, and which values, are both derived rather than chosen:
 
 ```sh
@@ -1204,14 +1282,14 @@ python3 fuzzing/axes/verify_axes.py .                                  # 18 chec
 python3 fuzzing/stages/verify_stages.py .                              # 24 checks: the repeat budget
 python3 fuzzing/resize/verify_resize.py .                              # 29 checks: the resize contract
 python3 fuzzing/synth/verify_synth.py .                                # 35 checks: element synthesis
-python3 fuzzing/direction/verify_direction.py .                        # 86 checks: the inverted direction
+python3 fuzzing/direction/verify_direction.py .                        # 108 checks: the inverted direction
 python3 fuzzing/fields/verify_fields.py .                              # 52 checks: the field model and its tiers
 python3 fuzzing/peers/verify_peers.py .                                # 38 checks: multi-peer runs
 python3 fuzzing/ledger/registries.py . --check                         # the registry tables are not stale
 python3 fuzzing/ledger/fields.py . --check                             # the field table is not stale
 ```
 
-352 checks, none of which needs a radio. The four topologies below do, and are not among
+374 checks, none of which needs a radio. The four topologies below do, and are not among
 them; `fuzzing/direction/verify_direction.py` checks everything about them that can be checked
 without one, including that each refuses to run with the subject and the victim the wrong
 way round.

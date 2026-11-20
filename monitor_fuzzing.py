@@ -15,6 +15,7 @@ process that died is not a judgement call.
 """
 
 import argparse
+import collections
 import json
 import os
 import shlex
@@ -372,13 +373,23 @@ def main():
     abandoned = {}
     ledger = Ledger() if (Ledger and not args.no_ledger) else None
 
+    # --quiet shows only fuzzing activity, which is right while a run is
+    # working and wrong when it never starts: a config hostapd rejects then
+    # produces an empty ledger and no reason anywhere. Keep the last lines so
+    # a subject that dies without ever fuzzing can be explained rather than
+    # reported as zero coverage.
+    tail = collections.deque(maxlen=20)
+    saw_fuzz_line = False
+
     try:
         for line in process.stdout:
             if not args.quiet or line.startswith(PREFIX):
                 print(line, end="")
+            tail.append(line.rstrip("\n"))
 
             if not line.startswith(PREFIX):
                 continue
+            saw_fuzz_line = True
 
             # Every [fuzz] line is a JSON object with a "msg" key: the prefix
             # means "this line is for the consumer", so one that does not parse
@@ -464,6 +475,23 @@ def main():
 
     returncode = process.wait()
     verdict = describe_exit(returncode)
+
+    #  A subject that never emitted a single [fuzz] line did not fuzz, and the
+    #  ledger about to be printed will say zero of everything. Zero coverage
+    #  and "your config was rejected" look identical in that report, so say
+    #  which one it was. The lines are kept even under --quiet, because that
+    #  is exactly when they were not printed as they went by.
+    if not saw_fuzz_line:
+        print(file=sys.stderr)
+        print("warning: the subject produced no [fuzz] lines at all, so this "
+              "run fuzzed nothing.", file=sys.stderr)
+        print("  Either it is not a CONFIG_FUZZ build (check -v), or it never "
+              "got far enough", file=sys.stderr)
+        print("  to transmit. Its last output follows.", file=sys.stderr)
+        print(file=sys.stderr)
+        for line in tail:
+            print("  | %s" % line, file=sys.stderr)
+        print(file=sys.stderr)
 
     dead = []
     for v in victims:
