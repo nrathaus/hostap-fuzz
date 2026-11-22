@@ -25,6 +25,7 @@
 #include "drivers/driver.h"
 #include "dpp.h"
 #include "dpp_i.h"
+#include "fuzz_reach.h"
 
 
 #ifdef CONFIG_TESTING_OPTIONS
@@ -133,11 +134,13 @@ int dpp_check_attrs(const u8 *buf, size_t len)
 		if (alen > end - pos) {
 			wpa_printf(MSG_DEBUG,
 				   "DPP: Truncated message - not enough room for the attribute - dropped");
+			fuzz_reach("dpp", buf, len, pos - 4 - buf);
 			return -1;
 		}
 		if (wrapped_data) {
 			wpa_printf(MSG_DEBUG,
 				   "DPP: An unexpected attribute included after the Wrapped Data attribute");
+			fuzz_reach("dpp", buf, len, pos - 4 - buf);
 			return -1;
 		}
 		if (id == DPP_ATTR_WRAPPED_DATA)
@@ -149,9 +152,11 @@ int dpp_check_attrs(const u8 *buf, size_t len)
 		wpa_printf(MSG_DEBUG,
 			   "DPP: Unexpected octets (%d) after the last attribute",
 			   (int) (end - pos));
+		fuzz_reach("dpp", buf, len, pos - buf);
 		return -1;
 	}
 
+	fuzz_reach("dpp", buf, len, pos - buf);
 	return 0;
 }
 

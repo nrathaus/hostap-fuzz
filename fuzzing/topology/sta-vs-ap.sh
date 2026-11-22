@@ -47,6 +47,20 @@ if ! "$STA" -v 2>&1 | grep -q 'fuzzing hooks are COMPILED IN'; then
 	exit 2
 fi
 
+# A victim that reports what it READ is what tells a case space that is
+# sweeping from one that is being discarded at the door. That is a DIFFERENT
+# flag from CONFIG_FUZZ -- a reach build mutates nothing and transmits
+# exactly what a stock build transmits -- so it is not the check above, and
+# it is a note rather than a requirement. A run without it still works, and
+# the ledger says NOT MEASURED instead of reporting a zero it cannot read.
+if "$AP" -v 2>&1 | grep -q 'Reach instrumentation is COMPILED IN'; then
+	echo "victim: reports what it read"
+else
+	echo "victim: NOT instrumented, so this run cannot say what it read."
+	echo "  Build one:  cd hostapd && cp defconfig .config &&"
+	echo "              echo CONFIG_FUZZ_REACH=y >> .config && make"
+fi
+
 if [ ! -d /sys/module/mac80211_hwsim ]; then
 	echo "error: mac80211_hwsim is not loaded." >&2
 	echo "  sudo modprobe mac80211_hwsim radios=0" >&2
@@ -82,6 +96,26 @@ sed -e "s|@AP_IFACE@|$AP_IFACE|" -e "s|@RUNDIR@|$RUNDIR|" \
 	"$ROOT/fuzzing/topology/ap-stock.conf" > "$RUNDIR/ap.conf"
 sed -e "s|@RUNDIR@|$RUNDIR|" \
 	"$ROOT/fuzzing/topology/sta-fuzz.conf" > "$RUNDIR/sta.conf"
+
+# W14. The source address as a swept domain. A station changes its address
+# only where its configuration asks it to, so a run that sets FUZZ_ADDRS and
+# nothing else presents ONE identity however many cases it sends -- and
+# every table keyed by address behind it sees a single peer.
+#
+#   mac_addr=2             change it per connection, keeping the OUI, so the
+#                          identities stay inside this radio's own block and
+#                          cannot collide with another radio's address.
+#   rand_addr_lifetime=0   and change it EVERY connection. The default is 60
+#                          seconds, which at this cadence is one identity
+#                          per few hundred cases.
+#
+# The ledger reports the ask and the delivery separately, so a run that sets
+# FUZZ_ADDRS without this says so rather than looking like it worked.
+if [ "${FUZZ_ADDRS:-0}" -gt 0 ]; then
+	export FUZZ_ADDRS
+	printf 'mac_addr=2\nrand_addr_lifetime=0\n' >> "$RUNDIR/sta.conf"
+	echo "source addresses: a domain of $FUZZ_ADDRS, per connection"
+fi
 
 # ASan's own abort is the signal we are watching for, so make sure it aborts.
 ASAN_OPTIONS=${ASAN_OPTIONS:-abort_on_error=1:detect_leaks=0}

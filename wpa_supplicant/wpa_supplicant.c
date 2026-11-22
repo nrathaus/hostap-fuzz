@@ -3436,11 +3436,13 @@ int wpas_update_random_addr(struct wpa_supplicant *wpa_s,
 	case WPAS_MAC_ADDR_STYLE_RANDOM:
 		if (random_mac_addr(addr) < 0)
 			return -1;
+		fuzz_source_addr("own-sta", addr);
 		break;
 	case WPAS_MAC_ADDR_STYLE_RANDOM_SAME_OUI:
 		os_memcpy(addr, wpa_s->perm_addr, ETH_ALEN);
 		if (random_mac_addr_keep_oui(addr) < 0)
 			return -1;
+		fuzz_source_addr("own-sta", addr);
 		break;
 	case WPAS_MAC_ADDR_STYLE_DEDICATED_PER_ESS:
 		if (!ssid) {

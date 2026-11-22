@@ -65,7 +65,8 @@ int main(int argc, char *argv[])
 \tfor (i = 0; i < iterations; i++) {
 \t\tos_memset(frame, 0x%02X, len);
 \t\tif (defer)
-\t\t\tapply_mutation_defer_log(target, type, frame, len);
+\t\t\tapply_mutation_defer_log(target, type, frame, len,
+\t\t\t\t\t\t len);
 \t\telse
 \t\t\tapply_mutation(target, type, frame, len);
 \t\twpa_snprintf_hex(hex, 2 * len + 2, frame, len);
@@ -97,7 +98,8 @@ int main(void)
 \tos_memset(frame, 0x%02X, sizeof(frame));
 \tfor (i = 0; i < 3; i++)
 \t\tapply_mutation_defer_log("eapol", FUZZ_TYPE_IEEE802_1X_HDR,
-\t\t\t\t\t frame, sizeof(frame));
+\t\t\t\t\t frame, sizeof(frame),
+\t\t\t\t\t sizeof(frame));
 \tfuzz_log_sent_frame(frame, sizeof(frame));
 
 \treturn 0;
@@ -447,12 +449,43 @@ def check_inventory(root, harness, check):
         return
 
     emitted = set(target_extract.extract(root))
-    check.ok(set(targets) == emitted,
-             f"it lists every label the tree emits ({len(emitted)})",
-             f"announced-not-emitted={sorted(set(targets) - emitted)} "
-             f"emitted-not-announced={sorted(emitted - set(targets))}")
+
+    # 'targets' is what THIS binary contains, not what the tree has: each
+    # entry in the generated table is wrapped in its call site's build
+    # condition, so a harness built without CONFIG_SAE announces no SAE
+    # target. The whole-tree claim moved to 'roster', and both halves are
+    # still asserted -- nothing announced that no call site emits, and
+    # nothing emitted that the roster forgets.
+    check.ok(set(targets) <= emitted,
+             f"every announced label is one the tree emits ({len(targets)})",
+             f"announced-not-emitted={sorted(set(targets) - emitted)}")
     check.ok(len(targets) == len(set(targets)),
              "with no duplicates")
+
+    roster = inventory[0].get("roster")
+    check.ok(isinstance(roster, list) and roster,
+             "the inventory carries a roster of every label in the tree",
+             repr(roster)[:120])
+    if isinstance(roster, list):
+        names = [e.get("name") for e in roster if isinstance(e, dict)]
+        check.ok(set(names) == emitted,
+                 f"and the roster is exactly the tree's labels ({len(emitted)})",
+                 f"roster-not-emitted={sorted(set(names) - emitted)} "
+                 f"emitted-not-rostered={sorted(emitted - set(names))}")
+        check.ok(set(targets) <= set(names),
+                 "and what this binary announces is a subset of it")
+        # A label absent from this build must say why, or the ledger cannot
+        # tell "excluded here" from "never reached".
+        absent = [e for e in roster
+                  if isinstance(e, dict) and e.get("name") not in set(targets)]
+        check.ok(all(e.get("guard") for e in absent),
+                 "and every label this build lacks carries its build condition",
+                 f"no guard: {sorted(e.get('name') for e in absent if not e.get('guard'))}")
+
+    daemon = inventory[0].get("daemon")
+    check.ok(isinstance(daemon, str) and daemon,
+             "the inventory names the daemon that announced it",
+             repr(daemon))
 
 
 def check_disable(harness, check):

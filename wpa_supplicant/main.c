@@ -328,6 +328,12 @@ int main(int argc, char *argv[])
 			       "frames it transmits and must not be used as a real station.\n"
 			       "Set FUZZ_DISABLE=1 to run it unmodified.\n");
 #endif /* CONFIG_FUZZ */
+#ifdef CONFIG_FUZZ_REACH
+			printf("Reach instrumentation is COMPILED IN: this build reports how\n"
+			       "far its own parsers got through what it was sent. It mutates\n"
+			       "nothing and is safe to use as a victim.\n"
+			       "Set FUZZ_REACH_DISABLE=1 to run it silent.\n");
+#endif /* CONFIG_FUZZ_REACH */
 			exitcode = 0;
 			goto out;
 		case 'W':

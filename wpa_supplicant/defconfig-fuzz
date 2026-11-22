@@ -97,3 +97,89 @@ NEED_OFFCHANNEL=y
 #CONFIG_ENC_ASSOC=y        # sta-auth-eppke-1, sta-auth-eppke-3
 #CONFIG_PQC=y
 #CONFIG_FILS=y             # sta-auth-fils
+
+# --------------------------------------------------------------------------
+# WHERE THIS BUILD SITS RELATIVE TO UPSTREAM defconfig
+#
+# Every setting on which this file differs from wpa_supplicant/defconfig is
+# accounted for below, and fuzzing/config/config.py --check fails both on a
+# delta with no line and on a line whose delta has gone away. Turning a flag
+# on to reach code is a decision about what a finding MEANS, and a run has to
+# be able to say which decision it made; the ledger prints the answer beside
+# the numbers. One line may cover several options where it is one decision.
+
+# WHY CONFIG_FUZZ: the hooks. Without it the mutation call sites in
+#   wpa_supplicant/ and src/rsn_supp/ compile away.
+# WHY CONFIG_MESH: mesh-plink and mesh-plink-ampe have no call site without
+#   it, and the mesh exchange is the only one where both ends run this same
+#   code. Upstream defconfig leaves it off.
+# WHY CONFIG_OCV: the station has to agree to OCV or the AP never inserts the
+#   OCI, so this decides content inside frames the AP build already mutates.
+# WHY CONFIG_SAE_PK: SAE-PK rides inside the SAE confirm this build already
+#   sends; it widens what is in the frame rather than adding one.
+# WHY CONFIG_ERP: wanted alongside the EAP methods kept below; it adds no
+#   802.11 frame of its own.
+# WHY CONFIG_TESTING_OPTIONS: ext_mgmt_frame_handling and ext_eapol_frame_io
+#   drive frames from outside without patching C. Not free -- it changes real
+#   behaviour on the DPP and PASN paths -- so a finding from this build
+#   carries it as a condition.
+# WHY NEED_OFFCHANNEL: CONFIG_TESTING_OPTIONS' MGMT_TX calls
+#   offchannel_send_action() and nothing in the Makefile pulls offchannel.o
+#   in for it. Upstream's own hwsim config does not hit this because it sets
+#   CONFIG_P2P, which happens to request it; asked for directly here rather
+#   than enabling a feature for its side effect.
+# WHY CONFIG_INTERNAL_LIBTOMMATH: INERT, as in hostapd/defconfig-fuzz. The
+#   -D sits inside `ifeq ($(CONFIG_CRYPTO), internal)` and this build does
+#   not set CONFIG_CRYPTO, so it never reaches the compiler and the bignum
+#   comes from OpenSSL. Set here and with no effect.
+
+# The other direction. Upstream defconfig sets all of these and this file
+# does not, so a run from this build has not covered them -- whatever its
+# numbers say. The first group is the one that costs something.
+
+# WHY CONFIG_WPS: upstream ships it on; off here. wps_parse_msg() is one of
+#   the four parsers W13 instrumented and it is in NEITHER shipped binary,
+#   so the wps-msg transmit target has no call site and nothing this harness
+#   sends is ever read by that walker. Of all the deltas in this file this is
+#   the largest single loss of parse surface.
+# WHY CONFIG_P2P CONFIG_INTERWORKING CONFIG_HS20 CONFIG_MBO: upstream ships
+#   all four on; off here. Together they are what makes the GAS/ANQP and P2P
+#   attribute surfaces exist, and their absence is measurable rather than
+#   theoretical: own-gas, own-p2p-dev and own-p2p-iface -- three of W14's six
+#   source identities -- exist in no binary of this configuration.
+# WHY CONFIG_DPP CONFIG_DPP2: upstream ships them on; off here, so
+#   dpp_check_attrs() -- another of W13's four parsers -- is in neither
+#   binary, and the dpp-tcp target has no call site.
+# WHY CONFIG_TDLS: upstream ships it on; off here, so the sta-tdls transmit
+#   target has no call site. One target, named, rather than a silent gap.
+# WHY CONFIG_OWE: upstream ships it on; off here, so the OWE Diffie-Hellman
+#   Parameter element is neither built nor parsed.
+
+# The rest cost the sweep nothing, and are listed because the check does not
+# let anything go unlisted -- which is the point: the line between "left out
+# because it does not matter" and "left out because nobody noticed" is drawn
+# here, by hand, rather than being left to be re-derived by whoever next
+# wonders why a number looks low.
+
+# WHY CONFIG_EAP_FAST CONFIG_EAP_GPSK CONFIG_EAP_GPSK_SHA256 CONFIG_EAP_IKEV2
+#   CONFIG_EAP_PAX CONFIG_EAP_PWD CONFIG_EAP_SAKE CONFIG_EAP_TNC
+#   CONFIG_SMARTCARD: EAP method bodies ride inside EAPOL-EAP frames and no
+#   hook in this tree mutates one -- the EAPOL-Key hooks sit below EAP. The
+#   methods kept above are what the rig's AP offers; these add nothing a
+#   sweep can reach.
+# WHY CONFIG_IEEE8021X_EAPOL: not set in this file and nevertheless ON in the
+#   build -- the Makefile derives it from the EAP methods above. It is listed
+#   because the delta is real at the level of the FILE, and it is the clearest
+#   case in either config of why the ledger reports the flags the BINARY was
+#   compiled with rather than the ones a .config asked for.
+# WHY CONFIG_DRIVER_WEXT CONFIG_DRIVER_WIRED CONFIG_DRIVER_MACSEC_LINUX
+#   CONFIG_MACSEC: the rig is hwsim, which is nl80211. The other driver
+#   back ends carry no 802.11 frame construction this harness hooks.
+# WHY CONFIG_CTRL_IFACE_DBUS_NEW CONFIG_CTRL_IFACE_DBUS_INTRO: the control
+#   path here is the UNIX socket; D-Bus would add a build dependency and no
+#   frame.
+# WHY CONFIG_IBSS_RSN CONFIG_WIFI_DISPLAY CONFIG_BGSCAN_SIMPLE: features with
+#   no transmit hook in this tree. IBSS RSN is the one worth revisiting if
+#   the mesh work is extended, since it is the other peer-to-peer RSN.
+# WHY CONFIG_DEBUG_SYSLOG: the runs here write a file and the monitor reads
+#   stdout; syslog would split the log in two.

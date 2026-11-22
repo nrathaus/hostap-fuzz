@@ -62,6 +62,24 @@ make CFLAGS="-fsanitize=address -fno-omit-frame-pointer -g -O1" LDFLAGS="-fsanit
 `fuzz.c` needs `json.o` and `base64.o`; `CONFIG_FUZZ` declares `NEED_JSON` and
 `NEED_BASE64` for you.
 
+### The victim build: `CONFIG_FUZZ_REACH=y`
+
+A second flag, and a different build. `CONFIG_FUZZ` mutates what the binary transmits;
+`CONFIG_FUZZ_REACH` reports what its own parsers read and mutates nothing. The victim
+in a two-process topology must be the second kind — both ends mutating is a run with no
+reference in it — and before there were two flags there was no build that could be a
+victim *and* say what it read.
+
+```sh
+cd hostapd
+cp defconfig .config && echo CONFIG_FUZZ_REACH=y >> .config && make
+./hostapd -v          # "Reach instrumentation is COMPILED IN"
+```
+
+It costs the stock build nothing, and that is checked rather than claimed: see
+[What the victim read](#what-the-victim-read). `fuzz_reach.c` writes its own JSON and
+pulls in no object a stock build does not already have.
+
 ### The station and mesh build
 
 The harness also hooks `wpa_supplicant`'s own transmit paths, which is a separate build:
@@ -203,7 +221,7 @@ Without a checkout it reports every numerator it recorded and says the denominat
 unavailable, rather than printing a table of zeros that would read as "nothing was sent".
 
 Reproducing one of their crashes needs the **same binary**, since a case id only means
-something within one case space. The `opset` on every line (`v2/7d/STRIDE/251@0`) is what
+something within one case space. The `opset` on every line (`v6/10d/STRIDE/251@0`) is what
 tells you whether their build and yours agree; if it differs, the same id is a different
 mutation. Send the binary, not the branch name.
 
@@ -455,6 +473,9 @@ has no `hapd` pointer at its call sites.
 | `FUZZ_HOLD_<TARGET>=1` | off | Answer one target **correctly**: its frames go out unmutated and it consumes no cases. This is how you reach a later stage — see [Phasing](#phasing). |
 | `FUZZ_SWEEP_DEPTH_FIRST=1` | off | Sweep every mutation at one byte offset before moving to the next, instead of the breadth-first default. Use it to localise a crash you have already seen — see [How the sweep works](#how-the-sweep-works). |
 | `FUZZ_REPEAT_<STAGE>` | `0` | Deliver a one-shot stage this many **extra** times per peer, so a stage the state machine produces once gets more than one case per session — see [Stage multiplicity](#stage-multiplicity). Clamped to 32. |
+| `FUZZ_ADDRS` | `0` | How many **distinct source addresses** one peer presents, cycling. The station's configuration has to ask for the change as well; the run script adds that when this is set — see [How many identities one peer presents](#how-many-identities-one-peer-presents). Each change costs an interface bounce. |
+| `FUZZ_TAIL=1` | off | Pin the span under test to the end of the frame. A second case space, told apart by the opset — see [Two case spaces](#two-case-spaces-fuzz_tail1). |
+| `FUZZ_REACH_DISABLE=1` | off | Silence a reach-instrumented build, so one binary can be a measured victim and an unmeasured one without being rebuilt. |
 
 Target names fold into variable names by uppercasing and replacing every non-alphanumeric
 character with `_`, so `auth-sae` is `FUZZ_START_AUTH_SAE` or `FUZZ_HOLD_AUTH_SAE`. The
@@ -502,11 +523,12 @@ being told. A subtype with no fixed fields — a Probe Request — gets no field
 than another subtype's, and a frame that ends mid-field gets only the fields that fit;
 clamping would write one field's octets under another's name.
 
-An Action frame contributes only its category octet. What follows is keyed by category
-through a second union and nothing in the struct says which category selects which member,
-so that mapping is not invented: everything past the category falls back to the octet
-sweep. The same applies anywhere the model is silent, which is why adding it cannot cost
-coverage.
+An Action frame used to contribute only its category octet, because what follows is keyed
+by category through a second union and nothing in the struct says which category selects
+which member. That mapping is still not invented. It is now read off the tree's own
+dispatch, which is the next section. Where it cannot be read, everything past the category
+still falls back to the octet sweep, and the same applies anywhere the model is silent,
+which is why adding to it cannot cost coverage.
 
 ### Reduction is declared, not quietly applied
 
@@ -547,6 +569,134 @@ elements. Measured by the ledger, under `FUZZ_TIER=FULL`:
 
 Under the default tier those are a measured fraction per run instead, complete over 251.
 The ledger prints which, per field, with the denominator.
+
+## The frame past the struct
+
+The field table above is derived from three structs and refuses to invent anything they do
+not say. That is the right rule, and it means the model ends where each struct ends,
+which on this product is not where the frame ends. Three things live out there, and
+`src/common/fuzz_layout.h` is all three, generated by `fuzzing/layout/layout.py`.
+
+### A field whose offset is solved for, not tabled
+
+`struct wpa_eapol_key` ends at `key_id`, offset 81. What follows it in the header is three
+*comments*:
+
+```c
+	/* variable length Key MIC field */
+	/* big endian 2-octet Key Data Length field */
+	/* followed by Key Data Length bytes of Key Data */
+```
+
+`key_data_length` is **the** length field on an EAPOL-Key frame and it was the one field of
+that frame nothing swept as a field. It cannot be another constant-offset row, because it
+sits at `sizeof(struct wpa_eapol_key) + mic_len` and `mic_len` comes from the negotiated
+AKM. A configuration axis moving a field offset is something no other row in the table
+does.
+
+So the generator reads those three comments as the declaration they are, takes the widths
+the gap can have out of `wpa_mic_len()` and the function it delegates to (`{0, 16, 24,
+32}`), and the engine solves for the offset in each frame from a value it already has:
+
+```
+base + gap + width + value == the frame's length
+```
+
+**Three answers, and they stay three.** One candidate is the case that gets swept. Zero and
+several are both real, since a short key data field can make two gaps fit, and both are
+reported as *unplaced* rather than resolved, because picking one of two writes a
+65,536-value domain into octets that belong to another field. Every run says how many
+frames the solver could not place; a domain that quietly is not there is the one thing this
+report may not produce.
+
+> **This guarantee is weaker than the table's, and the header says so.** A struct member has
+> a type and a name, and `--check` fails when it moves. These three lines are matched as
+> text, so a rewording fails the check, which is wanted, and a deletion upstream would
+> take the field out of the model. The candidate set also declares itself INCOMPLETE,
+> because two of `wpa_mic_len()`'s returns are not literals, so a frame the solver cannot
+> place is not necessarily a malformed one.
+
+### Whether the receiver reads it at all
+
+A field's domain is per **target**, not per frame layout. The 802.1X header's `length`
+field is a `u16`: 65,536 values, 270 of them a run. Measured in this tree:
+
+| | reads `hdr->length`? | |
+| --- | --- | --- |
+| station, `wpa_sm_rx_eapol()` | **yes** | reads all twelve named fields |
+| AP, `wpa_receive()` | **no** | and not `version`, `key_length` or `key_rsc` either |
+
+At `eapol`, where hostapd transmits and the station parses, that domain is live. At
+**`sta-eapol`, where the station transmits and the AP parses, four of the twelve named
+fields go to a receiver that never reads them**, two of them full `u16` domains. That is
+not weak coverage; it is none, and it reads exactly like coverage unless something says so.
+
+Every target carries the role it transmits as, from the directory its hook is in. The
+receiver is the rostered parser whose role is the other one, and every field case reports
+`read`:
+
+| `read` | means |
+| --- | --- |
+| `1` | the receiver on the other side reads this field |
+| `0` | it provably does not |
+| `-1` | **nothing here can say**: shared code, or a frame kind with no receiver rostered |
+
+The claim costs something as well as being reported. A dead field is swept at `LADDER`,
+the edges of its domain and of where the frame already was, and not at `STRIDE`, which is
+251 runs spent completing a domain nothing will look at. Eighteen cases is what it costs to
+keep a wrong claim from deleting a field outright, and setting `FUZZ_TIER` explicitly
+overrules it. Measured at `sta-eapol`: **189 cases down to 60**, the rest returned to fields
+something reads.
+
+**The read set is scoped to the FILE that holds the receive path, not to the function.** A
+receiver hands the frame to helpers beside it, and a claim scoped to one function would
+call a field dead that a helper three lines down reads. Over-claiming a read costs a
+finding; under-claiming one states a falsehood, so every rule errs the first way: an
+assignment, a `WPA_PUT_*` of the member and a copy *into* it are writes, and anything else
+counts as a read.
+
+The complement is a reachability gain rather than a saving. Both receivers bound the
+declared length with `>` and not `==`, so **trailing octets are accepted on both sides**:
+both EAPOL hooks now carry headroom and return a length, and the frame-length domain runs
+there, 379 distinct lengths where there had been one.
+
+### The Action payload, keyed by its own category
+
+`action.category` is one octet, and every surface in this harness's Action roster is behind
+it. The mapping from category to union member is not invented and not hand-written: a scope
+in the tree that tests or sets `u.action.category` against one constant, and the first
+member of `u.action.u.M` against another, has named the pair. The dispatch is split at its
+`case` labels, so hostapd's `handle_action()` is five scopes and not one.
+
+```sh
+python3 fuzzing/layout/layout.py .          # 14 layouts, 2 keys refused, 2 receivers
+python3 fuzzing/layout/layout.py . --check
+```
+
+**A key that more than one member claims is refused, not guessed at.** The wrong layout is
+worse than none: it writes real values at the wrong offsets *under the right names*. Both
+refusals are announced in the inventory and printed by the ledger, because a refusal nobody
+reports looks exactly like a category nobody uses.
+
+The layouts travel with their denominator: **14 of them, over 10 of the union's 21
+members**. The other eleven are members the tree's dispatch never names, and their frames
+keep the byte sweep. That is a figure, not a gap somebody forgot.
+
+What it bought, at one target:
+
+| `wnm-bss-tm-req` | before | now |
+| --- | --- | --- |
+| named fields | 0 | **5**, one of them a `le16` |
+| element chain starts at | whatever the walk could find | **7**, stated by the layout and by the hook, independently |
+
+A layout with no flexible array member is a positive statement that the frame has **no**
+element chain. `coloc_intf_req` is one, and its own hook had already said the same thing by
+using the resize entry point rather than the element one.
+
+Four hooked sites were declaring a frame kind that said less than they knew:
+`wnm-sleep-resp`, `wnm-bss-tm-req`, `mesh-plink` and `mesh-plink-ampe` each hand over a
+buffer that begins at the Category octet and each called it `FUZZ_TYPE_FRAME_BODY`. They
+are `FUZZ_TYPE_ACTION_BODY` now, which is what lets the layout table name their fields.
 
 ## Element synthesis
 
@@ -603,6 +753,54 @@ the element at an offset chosen by misreading a scalar.
 `apply_mutation_resize()` and `apply_mutation()` pass no chain offset and get no element
 cases at all, so every other call site is exactly what it was.
 
+### Which chain it is
+
+An element is `u8 id, u8 len, body`. **That is one of five TLV formats on this product**,
+and emitting an attribute under the wrong one is not a weaker case but a different one: the
+parser takes its length out of octets the engine filled with body, the chain still walks,
+and the run reports a length domain it did not sweep. Read out of the walkers themselves by
+`fuzzing/chain/chain.py`:
+
+| chain | walker | id | length | header |
+| --- | --- | --- | --- | --- |
+| `elem` | `__ieee802_11_parse_elems` | `u8` | `u8` | 2 |
+| `wps` | `wps_parse_msg` | `u16` **big endian** | `u16` **big endian** | 4 |
+| `dpp` | `dpp_get_attr` | `u16` little endian | `u16` little endian | 4 |
+| `p2p` | `p2p_parse_p2p_ie` | `u8` | `u16` little endian | 3 |
+| `nan` | `nan_de_get_attr` | `u8` | `u16` little endian | 3 |
+
+Each header size is **stated twice by its own walker**, by the reads it makes and by the
+minimum number of octets it refuses to walk below, and the generator fails on a
+disagreement rather than choosing between two readings. WPS and DPP differ in nothing but
+byte order, which is exactly the kind of difference a hand-written table loses.
+
+```sh
+python3 fuzzing/chain/chain.py .          # 4 formats beside the element chain, 211 members
+python3 fuzzing/chain/chain.py . --check
+```
+
+Each of the four carries a generated identity registry from its own enum, synthesised the
+way element ids are. That matters because **a sparse 16-bit identity is the stride problem
+again**: swept as a `u16` field, every defined WPS attribute type is reached in one run out
+of 251. Synthesised from the registry, all **88 of 88 arrive in run 1**.
+
+The chain travels in every message, because the identity spaces overlap: `0x1001` is
+`ATTR_AP_CHANNEL`, and `DPP_ATTR_I_BOOTSTRAP_KEY_HASH`, and is not an element id at all.
+The ledger keeps a tally per chain for the same reason.
+
+**Which chain a buffer holds comes from the call site**, like the offset and for the same
+reason. `wps-msg` names `FUZZ_CHAIN_WPS` with an offset of 0, because the whole message is
+that chain. The other three do not have a caller that can say: DPP over TCP multiplexes
+encapsulations whose prefixes differ on one socket, and the Action convergence point reads
+a *label* out of the frame but not a chain, and saying which protocol's attributes follow
+which label is the category-keyed guess the layout table declines to make. Naming a chain
+with the wrong offset would be worse than naming none.
+
+> `CONFIG_WPS`, `CONFIG_DPP`, `CONFIG_P2P` and `CONFIG_NAN_USD` are **off in both shipped
+> configurations**, so four of these five formats are mechanism for a build that turns them
+> on. The chain roster goes out in the inventory and the BUILD section says why the count is
+> zero, which is the whole point of reporting both.
+
 ### The registry tables are generated
 
 `src/common/fuzz_registries.h` is extracted from `src/common/ieee802_11_defs.h`, never
@@ -616,6 +814,64 @@ python3 fuzzing/ledger/registries.py . --check     # fails when the header has g
 The check is the point of generating it. Upstream adds members regularly, and a table that
 quietly falls behind re-narrows the very spotlight the synthesis exists to widen —
 silently, because a registry member that is never emitted looks exactly like one that is.
+
+### The lengths the parser enforces are generated too
+
+`src/common/fuzz_minima.h` is extracted from the three parse functions in
+`src/common/ieee802_11_common.c`:
+
+```sh
+python3 fuzzing/ledger/minima.py .                 # 39 guards over 39 element ids
+python3 fuzzing/ledger/minima.py . --emit-c        # writes src/common/fuzz_minima.h
+python3 fuzzing/ledger/minima.py . --check         # fails when a minimum has moved
+```
+
+Each guard's value is evaluated by **the compiler**, against the same headers and include
+paths the daemon is built with — 17 of the 39 are `sizeof(struct …)`, `2 * ETH_ALEN` or a
+named constant, and re-implementing C constant arithmetic in Python would be a second
+opinion about a number that has only one. The header carries the expression beside the
+value, so a crash record says `sizeof(struct rsn_ftie)` and not only `82`.
+
+The engine uses them to aim every length domain: the first length an element id is built
+with is the one its own parser insists on, rather than zero. A uniform sweep reaches that
+window in one run of 251; aimed, it reaches it in run 1.
+
+### Two case spaces: `FUZZ_TAIL=1`
+
+Every parser on this product hands out pointers *into* the frame and copies nothing —
+`ieee802_11_parse_elems()` alone fills 92 `(pointer, length)` pairs. A consumer that reads
+one octet past the end of its span reads the next element's id: same allocation, same
+page, no fault. Nothing for a crash oracle to see, and nothing for a sanitizer either.
+
+`FUZZ_TAIL=1` selects a second case space in which **the span under test is the last thing
+in the frame**:
+
+```sh
+FUZZ_TAIL=1 ./fuzzing/topology/sta-vs-ap.sh 30
+```
+
+A synthesised element goes in at the end whatever the position axis said, and an octet
+case cuts the frame to end where the element containing that octet ends — at the end of
+the span *the mutation produced*, not the one the builder wrote. An over-read then crosses
+the frame boundary instead of crossing into a sibling element.
+
+**This makes the defect reach past the buffer. It does not make it detectable.** Whether a
+read past the frame is observable depends on the victim's allocator and on how its driver
+handed the frame up. Against a victim built from source — which both hwsim topologies are
+— it is the difference between a sanitizer that can fire and one that cannot, and that is
+the whole of the claim. The ledger says so in the report rather than leaving it to be
+remembered.
+
+It costs a dimension: position in the chain is a domain, and pinning the span removes it.
+So the two run as separate campaigns — position swept for reach, last-position for
+observability — and the opset carries `/tail`, so a `case_id` from one never replays as
+the other. The cut also shortens the chain on purpose, which is why the ledger's "one
+hostile field" section reports a shortened chain here as the point rather than as a broken
+case space.
+
+Only where the call site opted into a frame of a different length, which is the same
+opt-in the length domain uses: `apply_mutation()` returns `void`, so a site that calls it
+sends what it built whatever the engine said.
 
 A synthesised element reports `"type":"MUT_ELEM"` with the id under `eid` or `ext_id`
 (never both — a consumer counting coverage must not have to infer which registry a number
@@ -776,6 +1032,410 @@ Two of these reach differently on purpose. A secured mesh MICs the peering body,
 `mesh-plink-ampe` is mutated before the MIC and at a fixed length; `mesh-plink`, with no
 MIC to keep, gets the length and element domains as well. One label over both would report
 a reach the run did not have.
+
+## What the victim read
+
+Everything above this line is the transmit side. It is all true, and not one number in it
+can tell a case space that is sweeping from one that is being **discarded at the door** —
+the walker stopped at item two, the frame was dropped before any handler ran, the daemon
+never dispatched it. From the transmit side those two runs look identical: same frames,
+same counters, same green run, same speed.
+
+Two figures from elsewhere on this product, for the size of the hazard rather than for
+anything they found: a generator aimed at the DPP attribute stream had **206 of 257** cases
+rejected before any handler ran, and one aimed at WPS reached the end of the parser **zero
+times in 40** while reporting a clean sweep.
+
+So the receiver says what it read. `CONFIG_FUZZ_REACH=y` compiles `src/common/fuzz_reach.c`
+into a build, and the hooks sit at the **exits of the receive-side walkers**:
+
+```
+[fuzz] {"msg":"reach","daemon":"hostapd","parser":"elems","seq":412,
+        "n":143,"got":143,"whole":1,"span":"000f686f737461702d66757a7a..."}
+```
+
+`n` is the span the walker was handed and `got` is how far into it the walker got. `got ==
+n` is a completed walk; `got < n` is a walk that stopped, and **where** it stopped is the
+receive-side counterpart of the `pre`/`post` depth every element case already reports from
+the transmit side.
+
+### It is a second flag, not a corner of the first
+
+`CONFIG_FUZZ_REACH` is separate from `CONFIG_FUZZ` on purpose. The victim in the inverted
+topology must not mutate — a run with both ends mutating has no reference in it — so it
+cannot be a `CONFIG_FUZZ` build, and until there were two flags there was no build that
+could both *be* a victim and *say what it read*. A reach build transmits exactly what a
+stock build transmits.
+
+That is checked rather than argued. `fuzzing/reach/verify_reach.py` compiles
+`ieee802_11_common.c` twice — once as it stands with the flag off, once with the
+`fuzz_reach()` lines deleted — and compares the generated code. They are identical.
+
+```sh
+cd hostapd && cp defconfig .config && echo CONFIG_FUZZ_REACH=y >> .config && make
+```
+
+The topology scripts say which kind of victim they were handed, and a run without one is
+reported as `NOT MEASURED` rather than as a zero.
+
+### The parse is matched to the case by its octets
+
+The receiver cannot know which case it is holding. It has no case counter, no target label,
+and no way to be told one without the harness putting something on the air a real peer
+would not send. So each parse quotes **the span it was given** and the ledger looks for it
+in the frames the run transmitted. A parse that matches is **attributed**; one that does
+not is **ambient** — the receiver parses ordinary traffic too, and a report that counted
+every parse would say the run was read perfectly while every mutated frame was being
+dropped at the door.
+
+Quoting the whole span rather than a fingerprint of it was learned from a live run, and
+it is worth knowing why, because it is a fact about this product rather than about this
+harness. **A station's association request is not the buffer the station built.**
+wpa_supplicant hands the driver its own elements; mac80211 builds the frame with *its*
+elements in front of them and a WMM element after them. Of the 143 octets the AP walked,
+85 were what the station sent — in the middle. Matching the head found nothing. Matching
+the head and the tail found nothing. Both reported every association request of the run as
+a frame nobody read, which is the exact wrong answer from an instrument whose job is to
+say when nobody read a frame.
+
+So the match is an **overlap**, not a containment: 16-octet windows of the span taken every
+8 octets, so any common run of 23 octets or more is found, and 23 octets of agreement
+between two frames is not chance. A match that is not the whole span is counted apart and
+reported — a walker that was handed *more* than the run sent is a different fact from one
+handed exactly it.
+
+Measured over one run's saved logs, 94 element spans:
+
+| matching | attributed |
+| --- | --- |
+| containment, or the first 16 octets, or the first and last 16 | **0** |
+| 16-octet windows every 8 | **42** |
+
+The contrast is the useful half. All 27 EAPOL-Key spans in the same run match *exactly* —
+that buffer is the one the station built. **The wrapping is mac80211's**, and it is there
+for every frame the kernel assembles, so any target on a management path inherits it.
+
+The window of recent cases is 16 deep. A hwsim frame is parsed within microseconds of being
+sent, and a deeper window would start crediting a parse to a case from a second ago — most
+often exactly where the run is repetitive.
+
+Which means the attribution is a **live** measurement: `monitor_fuzzing.py` reads the
+subject and each victim as they speak, and the interleaving is what places a parse. Running
+`ledger.py` afterwards over a saved subject log and a saved victim log separately will
+report the parsers and their states correctly and attribute nothing, because the two files
+carry no common clock. The ledger JSON a live run writes carries the attribution for a
+campaign to union.
+
+### A target that was never read is a failure
+
+Measured, two minutes, a fuzzing station against a reach-instrumented AP:
+
+```
+  per target        sent     read   through
+  sta-assoc-req       44       33         33
+  sta-eapol          101       27         27
+```
+
+`sta-eapol` is what this is for. **Three quarters of that target's cases never reached the
+KDE walker at all** — `wpa_receive()` rejects on the key info, the type or the length
+before the key data is parsed — and nothing anywhere in this harness could previously tell
+those 74 cases from 74 that swept. A target that reaches *nothing* gets a louder form of
+the same row — the shape of it, with whichever target it happens to be:
+
+```
+  TARGETS WHOSE CASES WERE NEVER READ
+    <target>         <n> cases sent, 0 reached an instrumented parser
+  This is a FAILURE and is printed as one.
+```
+
+Before this existed, that row was indistinguishable from a target that was working
+perfectly. **THE LIMIT**, printed beside it every time: "never read" means no *instrumented*
+parser read it. A target whose frames no hooked walker handles reads zero here and is a gap
+in the instrument, not in the sweep.
+
+Which is why the run also announces how big the instrument is. `fuzzing/reach/reach.py`
+counts every function in the tree that walks an element chain — through the shared
+`for_each_element*` macros, so the denominator is a property of the tree — against how many
+of them report:
+
+```
+  element walkers in the tree: 20, instrumented: 1
+    the other 19 are NOT MEASURED.
+```
+
+A reach figure quoted without that ratio reads as a claim about the product when it is a
+claim about one parser.
+
+### The roster is generated, and the rule is enforced
+
+Four parsers carry hooks today — `elems` (`__ieee802_11_parse_elems`), `kde`
+(`wpa_parse_kde_ies`), `wps` (`wps_parse_msg`) and `dpp` (`dpp_check_attrs`) — and
+`src/common/fuzz_reach_targets.h` is generated from their call sites, with each label's
+**build condition** derived the same way `targets.py` derives a transmit label's. So a
+binary without `CONFIG_WPS` announces `wps` as *absent from this run's binaries* rather
+than reporting it never reached: the same four states the transmit side uses, for the same
+reason.
+
+```sh
+python3 fuzzing/reach/reach.py . --check    # fails when the tree has moved
+python3 fuzzing/reach/reach.py . --gaps     # the element walkers with no hook
+```
+
+One rule is enforced rather than reported: **every `return` in a hooked function passes
+through the hook.** A walker with an unmarked early return reports fewer parses than
+happened, and every one it fails to report looks like a frame that never arrived. Upstream
+adding a `return -1` to a parser we hook fails `--check` instead of quietly halving the
+number.
+
+### Where the victim is not ours
+
+The weaker signal needs nothing compiled in and puts nothing new on the air: whether the
+victim *said* anything after a case.
+
+```
+  WITHOUT INSTRUMENTATION, the signal is what the victim
+  said: 312 lines, after 103 of 145 cases.
+  THE LIMIT: a log line is not a parse.
+```
+
+It is in the report because it is all there is where the victim is a binary somebody else
+built, and its bound is printed beside it because a number gets quoted without its bound
+otherwise.
+
+
+## How many identities one peer presents
+
+[More than one peer](#more-than-one-peer) sweeps concurrent peers with N real
+stations. Underneath that is a cheaper and larger domain, and it is the one that
+decides whether a second attempt at anything ever happens: **the number of distinct
+source addresses one peer presents.** The state that gates a second attempt on this
+product is keyed by address, not by radio — a WPS registrar's device list, a P2P peer
+table with its own eviction, SAE's comeback slots, a DPP Controller's connection
+list, and `nan_ndp_attr_handle_req()`, which refuses a second request from a peer
+already in progress. **One fixed address gets exactly one request through per run**,
+and everything behind the second is unreachable however many cases run.
+
+```sh
+FUZZ_ADDRS=4 ./fuzzing/topology/sta-vs-ap.sh 10
+```
+
+### Neither extra vifs nor injection
+
+Both obvious ways are wrong. N vifs is N stations — that is the multi-peer topology
+again, at N times the cost, answering a different question. And injection cannot be
+done from a hooked daemon at all: **an injected frame whose `addr2` matches no local
+interface is dropped by mac80211 before it leaves the radio**, silently, because it
+never resolves a channel context.
+
+So the domain goes where this product already changes its address on purpose — MAC
+address randomisation. The frame still leaves through the daemon's own vif, which is
+exactly what keeps that drop out of reach, and the sweep turns a coin toss into an
+enumeration.
+
+It needs the station's configuration as well as the environment variable, and the run
+script adds both when (and only when) `FUZZ_ADDRS` is set:
+
+```
+mac_addr=2             change it per connection, keeping the OUI
+rand_addr_lifetime=0   and change it EVERY connection — the default is 60 seconds,
+                       which at this cadence is one identity per few hundred cases
+```
+
+A run that sets `FUZZ_ADDRS` and does not get this says so rather than looking like it
+worked:
+
+```
+SOURCE ADDRESSES -- how many identities one peer presented
+  asked for: 4 (FUZZ_ADDRS)
+  AND NOT ONE ADDRESS EVER CHANGED.
+```
+
+### What varies, and what deliberately does not
+
+The value is **the case number**, placed in the address's varying octets, and nothing
+else. No mixing constant: what the tables behind this are keyed on is the address
+being *different*, and a counter is different by construction, reproducible across
+runs, and printable in a repro record.
+
+Octets 1..5 vary. **Octet 0 is never touched** — it carries the field's structure
+(unicast, locally administered) and the caller's own picker has just set it;
+re-applying that rule here would be a second copy of a rule that already exists. The
+consequence is reported rather than hidden: where the caller's style randomises the
+OUI, the run presents *more* distinct addresses than the domain asked for, and both
+numbers are printed.
+
+**The last octet is never zero**, and that is load-bearing rather than cosmetic. Every
+`mac80211_hwsim` radio in these topologies is addressed `02:00:00:00:NN:00`, so an
+address this produces cannot collide with one. A station that took its AP's address
+would not be a case; it would be a broken rig that looked like one.
+
+### The roster, and why the hook is not where it belongs
+
+The tree picks a source address in exactly two functions — `random_mac_addr()` and
+`random_mac_addr_keep_oui()`. One place to hook, covering every caller. It cannot be
+hooked: `src/utils/common.o` is linked into `hostapd_cli` and `wpa_cli`, which do not
+link the engine, so the call would not resolve.
+
+So the hook sits at the **callers**, six identities across four files, and
+`fuzzing/source/sources.py` is what replaces the single point:
+
+```sh
+python3 fuzzing/source/sources.py .            # the identities and their guards
+python3 fuzzing/source/sources.py . --check    # fails when the tree has moved
+```
+
+It refuses a function that asks the tree for an address more times than it reports,
+and separately refuses any function outside those two that open-codes the
+locally-administered bits — that second rule is what makes "every picker is hooked" a
+statement about the tree rather than about a list someone wrote down. Each identity
+carries its build condition, so `own-p2p-dev` in a build without `CONFIG_P2P` reads
+*absent from this run's binaries* rather than *never varied*.
+
+Every label begins `own-`, and the generator refuses one that does not. That is not
+cosmetic: the verifier's ground truth is the label's *string* surviving into the
+object its call site compiles to, and **the compiler merges a short string that is a
+suffix of a longer one** — a label of `"sta"` is invisible in any object that also
+holds `"...sta"`, which `wpa_supplicant.o` does. (Looking for the call site's
+*function* in the linked binary instead does not work either: `gas_query_set_sa()` is
+static and gets inlined away.) A naming rule that exists for a checker is a rule that
+will be broken the first time nobody remembers why, so the generator remembers.
+
+### Measured, and what it costs
+
+Two minutes, `FUZZ_ADDRS=4`, a fuzzing station against a stock AP: 4 distinct
+addresses over 15 changes, and the AP's own log shows all four as separate stations.
+
+**THE PRICE is large and is printed beside the number.** An address change takes the
+interface down and up — `nl80211_set_mac_addr()` clears the flags, sets the hwaddr and
+brings it back. The same two-minute rig went from **145 frames to 22** with the domain
+on. A case rate is not comparable across runs with different domains, and a campaign
+unioning them has to say which it was.
+
+**THE LIMIT:** this is occupancy and eviction, which is what those tables are keyed
+on. It does not claim to exercise how they *hash* — the values are a counter, so
+adjacent identities may land in adjacent buckets.
+
+
+## Which build the numbers came from
+
+Every domain above says what a run **swept**. This one says what existed to sweep.
+
+A sweep built without a flag reports clean on code the binary never contained, and it
+reports it in exactly the same words as a sweep that found nothing. Those are opposite
+results. Underneath the 591 run-time options `hostapd/config_file.c` parses is a second
+registry: **272 compile-time flags across the two Makefiles**, and which of them were on
+decides whether a parser is in the binary at all.
+
+So each binary announces its own, in the inventory line it already sends:
+
+```
+[fuzz] {"msg":"inventory","daemon":"hostapd","version":"2.13-devel-fuzz-2026-11-22",
+        "config":["CONFIG_ACS","CONFIG_FUZZ",...],
+        "config_roster":[["CONFIG_ACS",3,3,0,0],...]}
+```
+
+and the ledger prints it first, before any number it would otherwise qualify:
+
+```
+BUILD -- what existed to sweep
+  hostapd          2.13-devel-fuzz-2026-11-22
+                   25 flag(s) on, of 191 this Makefile tests
+                   9 NOT set by upstream defconfig
+                     CONFIG_ACS CONFIG_FUZZ CONFIG_IEEE80211AC ...
+                   4 set by upstream defconfig and NOT here
+                     CONFIG_DPP CONFIG_DPP2 CONFIG_EAP_GTC CONFIG_OWE
+                   63 flag(s) it cannot report either way: they reach
+                     no -D and steer the link only.
+```
+
+The two directions are different claims and both matter. **A finding behind a flag that
+ships commented out is a weaker claim than one in a default build**, so the run has to be
+able to say which it made — that is the first list. The second is the one that is easy to
+miss: parse surface upstream ships *on* that this build left out, which a run cannot have
+covered whatever its numbers say.
+
+### What the build cost this run
+
+Every roster this harness has — transmit targets, [source identities](#how-many-identities-one-peer-presents),
+[instrumented parsers](#what-the-victim-read) — already reports *absent from this build* as
+one of its four states. This is the sentence that follows it:
+
+```
+  WHAT THE BUILD COST THIS RUN
+    CONFIG_IEEE8021X_AUTH               3  send-8021x-auth-reply sta-auth-8021x ...
+    CONFIG_P2P                          3  own-gas own-p2p-dev own-p2p-iface
+    CONFIG_WPS                          1  wps-msg
+    CONFIG_DPP+CONFIG_DPP2              1  dpp-tcp
+```
+
+The guard each roster entry carries is evaluated against the flag set the binary
+announced, and when it comes out false the report searches for the flag that **alone**
+would bring the entry back. Turning every named flag on at once is not a valid probe: a
+guard with a `!defined()` in it is not monotone, and that was the first thing this got
+wrong. An entry no flag explains — the wrong daemon, or a guard with no flag in it — is
+counted apart rather than blamed on one.
+
+Guards arrive in the log as C preprocessor expressions and are **parsed, never `eval`'d**.
+A log is a file from somewhere else.
+
+### The shipped configurations are narrower than upstream's
+
+The largest thing this turned up is about this harness, not about hostap. `defconfig-fuzz`
+is not `defconfig` plus the hooks:
+
+| Off here, on in upstream `defconfig` | What it costs |
+| --- | --- |
+| `CONFIG_WPS` | `wps_parse_msg()`, one of the four instrumented parsers, is in **neither** binary. `wps-msg` has no call site |
+| `CONFIG_DPP`, `CONFIG_DPP2` | `dpp_check_attrs()`, another of the four, likewise. `dpp-tcp` has no call site |
+| `CONFIG_P2P`, `CONFIG_INTERWORKING`, `CONFIG_HS20`, `CONFIG_MBO` | `own-gas`, `own-p2p-dev` and `own-p2p-iface` — **three of the six source identities** — exist in no binary of this configuration |
+| `CONFIG_TDLS` | `sta-tdls` has no call site |
+| `CONFIG_OWE` | the OWE Diffie-Hellman Parameter element is neither built nor parsed |
+
+Every one of those was reachable before as *absent from this build*, in the same four-state
+table that has been there since the target roster. What was missing was the word *why*.
+
+### Every difference from upstream carries a reason
+
+`defconfig-fuzz` is a point in the flag space and used to be an undocumented one. Each of
+the **52 settings** on which the two fuzz configs differ from the upstream defconfigs now
+carries a `# WHY` line in the file, and `fuzzing/config/config.py --check` fails on a delta
+with no reason **and** on a reason whose delta has gone away, so neither side rots.
+
+That check paid for itself immediately: both files set `CONFIG_INTERNAL_LIBTOMMATH` with a
+reason about bignums, and it is **inert** — its `-D` sits inside
+`ifeq ($(CONFIG_CRYPTO), internal)` and neither build sets `CONFIG_CRYPTO`, so the option is
+set and never reaches the compiler. Both reasons now say so.
+
+### Three flags that do not compile on their own
+
+These read as a broken checkout and cost an afternoon each, so they are recorded as their
+**structural cause** — a member declared under one flag and read under another — and the
+cause is re-derived from the tree, so the record fails loudly when upstream fixes it rather
+than going on telling the next person a lie:
+
+| Flag | Member | Declared under | Read without it |
+| --- | --- | --- | --- |
+| `CONFIG_PASN` | `pasn->uncompressed` | `CONFIG_TESTING_OPTIONS` in `src/pasn/pasn_common.h` | `src/pasn/pasn_initiator.c:642` |
+| `CONFIG_INTERWORKING` | `ssid->roaming_consortium_selection` | `CONFIG_HS20` in `wpa_supplicant/config_ssid.h` | `wpa_supplicant/interworking.c:1661` |
+| `CONFIG_IEEE80211AX` / `BE` | `conf->he_oper_chwidth`, `conf->eht_oper_chwidth` | `CONFIG_IEEE80211AX` / `BE` in `src/ap/ap_config.h` | `src/ap/ctrl_iface_ap.c:851`, `:881` |
+
+The third is why `defconfig-fuzz` forces AC + AX + BE together: **upstream does not build
+with its own defconfig at this pin.**
+
+### The limits, stated
+
+* This says what the **binary** was built with, not what a `.config` asked for. The Makefile
+  derives a great deal: `CONFIG_IEEE8021X_EAPOL` is absent from
+  `wpa_supplicant/defconfig-fuzz` and on in the build, because the EAP methods set it.
+* **79 of the 272 flags reach no `-D` of their own name** and steer only which objects are
+  linked. No binary can report them. For those, absent from the on-list means *cannot tell*,
+  not *off* — and the roster carries a `witness` column so the report can say which.
+* A flag tested for its **value** rather than for being set — `CONFIG_TLS=openssl` — is
+  marked as such and never reported on or off, because on/off is the wrong question about it.
+* Two runs of the same daemon built differently, unioned into one log, make every number a
+  sum over code that was not the same code. The ledger says **TWO BUILDS UNDER ONE NAME**
+  when it sees that; nothing else here would notice.
+
 
 ## Phasing
 
@@ -1021,8 +1681,16 @@ it reproduces a different frame *without complaining* — so a repro record carr
 another one. This is the hazard already documented here for `order` and for
 `CASES_PER_OFFSET`, with more axes.
 
-`frame` says what the buffer **is** — `mgmt`, `eapol` or `body` — and every mutation
-message carries it. A consumer that instead guesses the layout from the target's name is
+`from` and `read` are on every field case. `from` says where the row came from: a member
+of a struct the generator could read, an offset **solved for** in this frame, or the layout
+an Action frame's category selects. `read` says whether the receiver on the other side
+of this target reads those octets at all, with `-1` for "nothing here can say". `chain` is
+on every synthesised item, because the five TLV formats have overlapping identity spaces
+and a number without its chain is unreadable. All four are described under
+[The frame past the struct](#the-frame-past-the-struct).
+
+`frame` says what the buffer **is**, one of `mgmt`, `eapol`, `action`, `body` or
+`stream`, and every mutation message carries it. A consumer that instead guesses the layout from the target's name is
 wrong the first time someone names a call site something sensible, and silently so: a
 mutated frame failing to dissect is an ordinary outcome here. `body` means a frame body
 with no header of its own, because the driver builds one; its first octet is an element id
@@ -1035,13 +1703,13 @@ running configuration actually emits, as opposed to what the sweep turned it int
 
 | `msg` | when | fields |
 | --- | --- | --- |
-| `inventory` | once, before any other message | `targets`, `stages` |
+| `inventory` | once, before any other message | `targets`, `stages`, `config`, `layouts`, `var_fields`, `readers`, `chains` |
 | `repeat` | a one-shot stage was re-issued | `stage`, `n`, `of`, `peer` |
 | `fuzz` (`type":"MUT_LEN"`) | a length case | `was`, `len` instead of `idx`/`mask`/`before`/`after` |
-| `fuzz` (`type":"MUT_ELEM"`) | a synthesised element | `eid` or `ext_id`, `body`, `pos`, `npos`, `at`, `copies`, `was`, `len` |
+| `fuzz` (`type":"MUT_ELEM"`) | a synthesised element or attribute | `chain`, `eid` or `ext_id`, `body`, `pos`, `npos`, `at`, `copies`, `was`, `len` |
 | `fuzz` (`type":"MUT_CHAIN"`) | the chain's shape changed | `op`, `i`, `j`, `nelem`, `was`, `len` |
-| `fuzz` (`type":"MUT_FIELD"`) | a named field took a value from its domain | `field`, `at`, `width`, `tier`, `before`, `after`, `len` |
-| `fuzz` (`type":"MUT_PATTERN"`) | an opaque field was filled | `field`, `at`, `width`, `pattern`, `len` |
+| `fuzz` (`type":"MUT_FIELD"`) | a named field took a value from its domain | `field`, `from`, `read`, `at`, `width`, `tier`, `before`, `after`, `len` |
+| `fuzz` (`type":"MUT_PATTERN"`) | an opaque field was filled | `field`, `from`, `read`, `at`, `width`, `pattern`, `len` |
 
 `peer` appears on `progress` and on every `fuzz` message whenever it is known, so a run
 with several peers in flight says which one received which case.
@@ -1128,7 +1796,7 @@ command, and writes a record to `--repro-dir`:
   "who": "victim",
   "exit": "killed by signal 11 (SIGSEGV)",
   "returncode": -11,
-  "opset": "v2/7d/STRIDE/251@0",
+  "opset": "v6/10d/STRIDE/251@0",
   "replay_env": { "FUZZ_START_AUTH_SAE": 1235 },
   "case": { "msg": "fuzz", "target": "auth-sae", "idx": 4, ... }
 }
@@ -1272,7 +1940,7 @@ The behavioural half is re-runnable — no radio, no root — and should be run 
 to `src/common/fuzz.c`:
 
 ```sh
-python3 fuzzing/verify/fuzz_verify/fuzz_verify.py .                    # 47 checks: sweep, hold, contract
+python3 fuzzing/verify/fuzz_verify/fuzz_verify.py .                    # 52 checks: sweep, hold, contract
 python3 fuzzing/verify/fuzz_output_contract/fuzz_output_contract.py .  # 4 checks: the output contract
 python3 fuzzing/phasing/phase_starvation.py ./hostapd/hostapd
 python3 fuzzing/verify/sweep_ordering/verify_ordering.py .             # 19 checks: sweep order
@@ -1281,15 +1949,28 @@ python3 fuzzing/stages/stages.py . --check                             # the ann
 python3 fuzzing/axes/verify_axes.py .                                  # 18 checks: the axis list is derived
 python3 fuzzing/stages/verify_stages.py .                              # 24 checks: the repeat budget
 python3 fuzzing/resize/verify_resize.py .                              # 29 checks: the resize contract
-python3 fuzzing/synth/verify_synth.py .                                # 35 checks: element synthesis
-python3 fuzzing/direction/verify_direction.py .                        # 108 checks: the inverted direction
-python3 fuzzing/fields/verify_fields.py .                              # 52 checks: the field model and its tiers
+python3 fuzzing/synth/verify_synth.py .                                # 98 checks: element synthesis
+python3 fuzzing/tail/verify_tail.py .                                  # 26 checks: the tail case space
+python3 fuzzing/reach/verify_reach.py .                                # 67 checks: what the victim read
+python3 fuzzing/source/verify_sources.py .                             # 52 checks: distinct source identities
+python3 fuzzing/config/verify_config.py .                              # 72 checks: the compile-time axis
+python3 fuzzing/layout/verify_layout.py .                              # 101 checks: the frame past the struct
+python3 fuzzing/direction/verify_direction.py .                        # 115 checks: the inverted direction
+python3 fuzzing/fields/verify_fields.py .                              # 53 checks: the field model and its tiers
 python3 fuzzing/peers/verify_peers.py .                                # 38 checks: multi-peer runs
+python3 fuzzing/action/verify_action.py .                              # 39 checks: the Action frame labels
+python3 fuzzing/ledger/verify_ledger.py .                              # 63 checks: the ledger's own claims
 python3 fuzzing/ledger/registries.py . --check                         # the registry tables are not stale
 python3 fuzzing/ledger/fields.py . --check                             # the field table is not stale
+python3 fuzzing/ledger/minima.py . --check                             # the enforced lengths are not stale
+python3 fuzzing/reach/reach.py . --check                               # the reach roster is not stale
+python3 fuzzing/source/sources.py . --check                            # every address picker is hooked
+python3 fuzzing/config/config.py . --check                             # the flag space, and every defconfig delta has a reason
+python3 fuzzing/layout/layout.py . --check                             # the layouts and the read sets are not stale
+python3 fuzzing/chain/chain.py . --check                               # the five TLV formats are not stale
 ```
 
-374 checks, none of which needs a radio. The four topologies below do, and are not among
+870 checks, none of which needs a radio. The four topologies below do, and are not among
 them; `fuzzing/direction/verify_direction.py` checks everything about them that can be checked
 without one, including that each refuses to run with the subject and the victim the wrong
 way round.
@@ -1528,12 +2209,15 @@ derives, generates or checks something lives under `fuzzing/`, one directory per
 | `fuzzing/verify/` | the older verifiers: the sweep itself, the output contract, sweep order |
 | `fuzzing/topology/` | the hwsim run scripts, their configs and the per-peer generator |
 | `fuzzing/peers/` | the multi-peer verifier |
+| `fuzzing/reach/` | the receive-side roster and its verifier: what the victim's parsers read |
+| `fuzzing/source/` | the source-address roster and its verifier: how many identities one peer presents |
 | `fuzzing/live/` | the real-RF run: a hostapd against an actual station, and the recorded results |
 | `fuzzing/phasing/` | the starvation measurement: which stage blocks the ones behind it |
 
 **Nothing under `fuzzing/` is needed to build.** `hostapd/` and `wpa_supplicant/` compile
 from `src/` alone; the generated headers it produces (`src/common/fuzz_registries.h`,
-`src/common/fuzz_fields.h`) are committed, so a checkout builds without running any of it. What `fuzzing/` is for is
+`src/common/fuzz_fields.h`, `src/common/fuzz_targets.h`, `src/common/fuzz_minima.h`,
+`src/common/fuzz_reach_targets.h`, `src/common/fuzz_sources.h`) are committed, so a checkout builds without running any of it. What `fuzzing/` is for is
 keeping those headers honest — `--check` on each generator fails when the tree has moved
 and the header has not.
 

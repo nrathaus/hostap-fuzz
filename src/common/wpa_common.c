@@ -22,6 +22,7 @@
 #include "defs.h"
 #include "common/nan_defs.h"
 #include "wpa_common.h"
+#include "fuzz_reach.h"
 
 
 static unsigned int wpa_kck_len(int akmp, size_t pmk_len)
@@ -4560,6 +4561,10 @@ int wpa_parse_kde_ies(const u8 *buf, size_t len, struct wpa_eapol_ie_parse *ie)
 		}
 	}
 
+	/* 'pos' is where the walk stopped, which a break out of the loop
+	 * above leaves short of 'end' -- the underflow case and the padding
+	 * case both. */
+	fuzz_reach("kde", buf, len, pos - buf);
 	return ret;
 }
 

@@ -11,6 +11,7 @@
 #include "common.h"
 #include "wps_defs.h"
 #include "wps_attr_parse.h"
+#include "common/fuzz_reach.h"
 
 #ifndef CONFIG_WPS_STRICT
 #define WPS_WORKAROUNDS
@@ -615,6 +616,9 @@ int wps_parse_msg(const struct wpabuf *msg, struct wps_parse_attr *attr)
 			wpa_printf(MSG_DEBUG, "WPS: Invalid message - "
 				   "%lu bytes remaining",
 				   (unsigned long) (end - pos));
+			fuzz_reach("wps", wpabuf_head(msg),
+				   wpabuf_len(msg),
+				   pos - (const u8 *) wpabuf_head(msg));
 			return -1;
 		}
 
@@ -644,6 +648,9 @@ int wps_parse_msg(const struct wpabuf *msg, struct wps_parse_attr *attr)
 				continue;
 			}
 #endif /* WPS_WORKAROUNDS */
+			fuzz_reach("wps", wpabuf_head(msg),
+				   wpabuf_len(msg),
+				   pos - (const u8 *) wpabuf_head(msg));
 			return -1;
 		}
 
@@ -672,8 +679,12 @@ int wps_parse_msg(const struct wpabuf *msg, struct wps_parse_attr *attr)
 		}
 #endif /* WPS_WORKAROUNDS */
 
-		if (wps_set_attr(attr, type, pos, len) < 0)
+		if (wps_set_attr(attr, type, pos, len) < 0) {
+			fuzz_reach("wps", wpabuf_head(msg),
+				   wpabuf_len(msg),
+				   pos - (const u8 *) wpabuf_head(msg));
 			return -1;
+		}
 
 #ifdef WPS_WORKAROUNDS
 		prev_type = type;
@@ -681,5 +692,7 @@ int wps_parse_msg(const struct wpabuf *msg, struct wps_parse_attr *attr)
 		pos += len;
 	}
 
+	fuzz_reach("wps", wpabuf_head(msg), wpabuf_len(msg),
+		   pos - (const u8 *) wpabuf_head(msg));
 	return 0;
 }

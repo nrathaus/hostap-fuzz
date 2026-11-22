@@ -13,6 +13,7 @@
 #include "common/ieee802_11_defs.h"
 #include "wps_i.h"
 #include "wps_dev_attr.h"
+#include "common/fuzz.h"
 
 
 #ifdef CONFIG_WPS_TESTING
@@ -221,10 +222,50 @@ enum wps_process_res wps_process_msg(struct wps_data *wps,
  */
 struct wpabuf * wps_get_msg(struct wps_data *wps, enum wsc_op_code *op_code)
 {
+	struct wpabuf *msg;
+#ifdef CONFIG_FUZZ
+	size_t len;
+	u8 *mutated;
+#endif /* CONFIG_FUZZ */
+
 	if (wps->registrar)
-		return wps_registrar_get_msg(wps, op_code);
+		msg = wps_registrar_get_msg(wps, op_code);
 	else
-		return wps_enrollee_get_msg(wps, op_code);
+		msg = wps_enrollee_get_msg(wps, op_code);
+
+#ifdef CONFIG_FUZZ
+	/*
+	 * Both WPS roles pass through here on the way out, so one hook
+	 * reaches a module that had none -- 22,031 lines, and every parser in
+	 * it behind an EAP-WSC exchange that nothing in this harness was
+	 * pointed at.
+	 *
+	 * A WPS message is a chain of attributes, not of elements: a 2-octet
+	 * big-endian type and a 2-octet big-endian length, against an
+	 * element's one and one. The whole message is that chain, so the
+	 * offset is 0 and the format is named -- the engine then synthesises
+	 * attributes of the right shape instead of writing a length into the
+	 * octets wps_parse_msg() reads as half of a type. Both numbers come
+	 * from the caller because only the caller knows what it is holding.
+	 */
+	if (!msg || !fuzz_enabled())
+		return msg;
+	len = wpabuf_len(msg);
+	mutated = apply_mutation_copy("wps-msg", FUZZ_TYPE_FRAME_BODY,
+				      wpabuf_head_u8(msg), &len, FUZZ_HEADROOM,
+				      0, FUZZ_CHAIN_WPS);
+	if (mutated) {
+		struct wpabuf *out = wpabuf_alloc_copy(mutated, len);
+
+		os_free(mutated);
+		if (out) {
+			wpabuf_free(msg);
+			msg = out;
+		}
+	}
+#endif /* CONFIG_FUZZ */
+
+	return msg;
 }
 
 

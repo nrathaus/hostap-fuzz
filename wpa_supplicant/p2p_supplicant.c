@@ -15,6 +15,7 @@
 #include "common/ieee802_11_common.h"
 #include "common/ieee802_11_defs.h"
 #include "common/wpa_ctrl.h"
+#include "common/fuzz.h"
 #include "wps/wps_i.h"
 #include "p2p/p2p.h"
 #include "ap/hostapd.h"
@@ -2778,6 +2779,7 @@ static int wpas_p2p_add_group_interface(struct wpa_supplicant *wpa_s,
 
 	if (wpa_s->conf->p2p_interface_random_mac_addr) {
 		random_mac_addr(wpa_s->pending_interface_addr);
+		fuzz_source_addr("own-p2p-iface", wpa_s->pending_interface_addr);
 		wpa_printf(MSG_DEBUG, "P2P: Generate random MAC address " MACSTR
 			   " for the group",
 			   MAC2STR(wpa_s->pending_interface_addr));
@@ -5877,6 +5879,7 @@ int wpas_p2p_mac_setup(struct wpa_supplicant *wpa_s)
 				"Failed to generate random MAC address");
 			return -EINVAL;
 		}
+		fuzz_source_addr("own-p2p-dev", addr);
 
 		/* Store generated MAC address. */
 		os_memcpy(wpa_s->conf->p2p_device_persistent_mac_addr, addr,

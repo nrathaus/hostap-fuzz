@@ -72,6 +72,18 @@ NEED_JSON=y
 NEED_BASE64=y
 endif
 
+# Reach instrumentation. SEPARATE from CONFIG_FUZZ on purpose: this is what a
+# VICTIM is built with, and a victim that also mutates is a run with no
+# reference in it. The hooks sit at the exits of the receive-side walkers and
+# report how far each one got; they change no parse decision, so a reach build
+# transmits exactly what a stock build transmits.
+ifdef CONFIG_FUZZ_REACH
+CFLAGS += -DCONFIG_FUZZ_REACH
+# Marked in -v for the same reason CONFIG_FUZZ is: a topology script has to be
+# able to tell a measured victim from an unmeasured one without reading a log.
+OBJS += ../src/common/fuzz_reach.o
+endif
+
 OBJS += ../src/ap/hostapd.o
 OBJS += ../src/ap/wpa_auth_glue.o
 OBJS += ../src/ap/drv_callbacks.o

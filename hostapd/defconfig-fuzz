@@ -69,8 +69,8 @@ CONFIG_INTERNAL_LIBTOMMATH=y
 #CONFIG_ROBUST_AV=y
 #CONFIG_AFC=y
 #
-# CONFIG_OWE became a default-on option upstream; it is left at the upstream
-# default rather than being forced here.
+# CONFIG_OWE is NOT at the upstream default: upstream defconfig sets it and
+# this file does not. See the accounting block at the end.
 
 # WNM on the AP side: WNM-Sleep Mode Response, BSS Transition Management
 # Request and Collocated Interference Request are frames hostapd builds and
@@ -88,3 +88,65 @@ CONFIG_WNM=y
 # already under mutation rather than frames nothing touches.
 CONFIG_OCV=y
 
+
+# --------------------------------------------------------------------------
+# WHERE THIS BUILD SITS RELATIVE TO UPSTREAM defconfig
+#
+# Every setting on which this file differs from hostapd/defconfig is
+# accounted for below, and fuzzing/config/config.py --check fails both on a
+# delta with no line and on a line whose delta has gone away. That is not
+# bookkeeping. Turning a flag on to reach code is a decision about what a
+# finding MEANS -- a defect behind a flag that ships commented out is a
+# weaker claim than one in a default build -- and a run has to be able to say
+# which decision it made. The ledger prints the answer beside the numbers.
+#
+# One line may cover several options where it is one decision.
+
+# WHY CONFIG_FUZZ: the hooks. Everything else here is downstream of wanting
+#   them: without it every mutation call site in src/ap compiles away.
+# WHY CONFIG_IEEE80211AC CONFIG_IEEE80211AX CONFIG_IEEE80211BE: not a choice.
+#   Upstream does not build with its own defconfig at this pin -- the detail
+#   is in the comment above CONFIG_IEEE80211BE. Forced here, and the three
+#   come out together once upstream guards those three uses.
+# WHY CONFIG_SAE: WPA3-Personal is the target this build exists for. Without
+#   it the SAE authentication path is compiled out and four transmit hooks
+#   have no call site.
+# WHY CONFIG_OCV: adds the OCI KDE to the EAPOL-Key key data and the OCI
+#   element to the WNM-Sleep Mode Response -- content inside frames already
+#   under mutation, rather than new frames.
+# WHY CONFIG_WNM: six transmit hooks in src/ap/wnm_ap.c have no call site
+#   without it. Absent, not under-fuzzed.
+# WHY CONFIG_TESTING_OPTIONS: ext_mgmt_frame_handling and ext_eapol_frame_io
+#   drive frames from outside without patching C. It is NOT free -- it also
+#   changes real behaviour on the DPP and PASN paths -- so a finding from
+#   this build carries it as a condition.
+# WHY CONFIG_INTERNAL_LIBTOMMATH: INERT, and left in place with this said
+#   out loud. Its -DCONFIG_INTERNAL_LIBTOMMATH sits inside
+#   `ifeq ($(CONFIG_CRYPTO), internal)` in the Makefile, and this build
+#   does not set CONFIG_CRYPTO, so the option is set here and never
+#   reaches the compiler: the bignum comes from OpenSSL. Found by the
+#   W15 check comparing .config against the real compile line, which is
+#   the whole argument for reporting the flags the BINARY was built with.
+# WHY CONFIG_ACS: carried from the original WPA3 build. The hwsim rig pins
+#   the channel, so this changes nothing the sweep reaches; it is listed here
+#   because it IS a difference from upstream, which is the only claim this
+#   block makes about it.
+
+# The other direction, and the one that is easy to miss: options upstream
+# defconfig SETS that this build does not. Each is parse surface a run from
+# this file cannot have covered, whatever its numbers say.
+
+# WHY CONFIG_DPP CONFIG_DPP2: upstream defconfig ships these on and this
+#   build does not. The cost is exact and is not hypothetical: the dpp-tcp
+#   transmit target has no call site here, and dpp_check_attrs() -- one of
+#   the four parsers W13 instrumented -- is not in this binary, so nothing
+#   this build sends is ever read by it. Turn them on to sweep that surface;
+#   leaving them off is a narrowing, not a default.
+# WHY CONFIG_OWE: upstream defconfig sets it. Off here, so the OWE
+#   Diffie-Hellman Parameter element is neither built nor parsed by this
+#   binary. Same shape of loss as DPP, one element wide.
+# WHY CONFIG_EAP_GTC: upstream sets it; this build carries MD5, TLS,
+#   MSCHAPv2, PEAP and TTLS only. EAP method bodies ride inside EAPOL-EAP
+#   frames, which no hook in this tree mutates -- the EAPOL-Key hooks sit
+#   below EAP -- so this one costs the sweep nothing. It is listed because
+#   the check does not let it go unlisted.

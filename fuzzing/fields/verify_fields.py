@@ -509,11 +509,22 @@ def check_opset(root, binary, check):
 
     # The hazard this exists for: the same case_id under two case spaces is
     # two different frames.
-    fa, _ = run(binary, "t-same", 40, env={"FUZZ_TIER": "FULL"})
-    fb, _ = run(binary, "t-same", 40, env={"FUZZ_TIER": "LADDER"})
+    #
+    # The two agree for the first few cases of each field, and since W11 they
+    # agree deliberately: both orderings now start at the window above the
+    # parser's minimum, so a reduction's first entries ARE the enumeration's
+    # first entries. That is the point of the window, not a collision -- the
+    # case spaces still diverge, and the run below is long enough to reach
+    # where they do rather than long enough to be lucky.
+    fa, _ = run(binary, "t-same", 300, env={"FUZZ_TIER": "FULL"})
+    fb, _ = run(binary, "t-same", 300, env={"FUZZ_TIER": "LADDER"})
     check.ok(fa != fb,
              "and the same case_id under two of them really is two "
              "different frames")
+    same = sum(1 for x, y in zip(fa, fb) if x == y)
+    check.ok(same,
+             "while the cases they agree on are the window both of them put "
+             "first (%d of %d)" % (same, min(len(fa), len(fb))))
 
 
 def check_registries(root, binary, check):

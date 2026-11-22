@@ -183,19 +183,29 @@ def report_ledger(ledger, args, returncode, verdict):
 class Victim:
     """A second process, launched alongside the subject and watched.
 
-    It carries no hooks and sends nothing: it is only here to die. Its exit is
-    the one signal this harness trusts, which is why it is watched on a thread
-    rather than polled -- a subject that stalls would otherwise keep a dead
-    victim unnoticed for as long as it stayed quiet.
+    It sends nothing and mutates nothing: a victim that mutated would leave
+    the run with no reference in it. Its exit is the one signal this harness
+    trusts, which is why it is watched on a thread rather than polled -- a
+    subject that stalls would otherwise keep a dead victim unnoticed for as
+    long as it stayed quiet.
+
+    It may, however, SPEAK. A victim built with CONFIG_FUZZ_REACH reports how
+    far its own parsers got through what it was handed, which is the one fact
+    the subject cannot know and the only thing that tells a case space that is
+    sweeping from one that is being discarded at the door. So its output is
+    read line by line here rather than handed straight to a file: the file
+    still gets every line, and the [fuzz] ones also reach the ledger.
     """
 
-    def __init__(self, cmd, log_path):
+    def __init__(self, cmd, log_path, on_line=None):
         self.cmd = cmd
         self.log_path = log_path
         self.returncode = None
+        self.on_line = on_line
         self.log = open(log_path, "w")
-        self.proc = subprocess.Popen(cmd, stdout=self.log,
-                                     stderr=subprocess.STDOUT, text=True)
+        self.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                     stderr=subprocess.STDOUT, text=True,
+                                     bufsize=1)
         self.died = threading.Event()
         self.thread = threading.Thread(target=self._wait, daemon=True)
 
@@ -204,6 +214,21 @@ class Victim:
         self.thread.start()
 
     def _wait(self):
+        # Reading to EOF first: the process is gone once its stdout closes,
+        # and draining it here is what keeps a chatty victim from blocking on
+        # a full pipe -- which, before this read existed, it could not do,
+        # because the file was the pipe.
+        try:
+            for line in self.proc.stdout:
+                self.log.write(line)
+                if self.on_line:
+                    self.on_line(line)
+        except (OSError, ValueError):
+            pass
+        try:
+            self.log.flush()
+        except (OSError, ValueError):
+            pass
         self.returncode = self.proc.wait()
         self.died.set()
         self._on_death()
@@ -216,8 +241,16 @@ class Victim:
             except subprocess.TimeoutExpired:
                 self.proc.kill()
                 self.proc.wait()
+        # The reader thread still has the tail of the output in flight, and
+        # tail() below reads the file it is writing. Joining is what makes
+        # "what the victim said before it died" the whole of it.
+        if self.thread.is_alive():
+            self.thread.join(timeout=5)
         self.returncode = self.proc.returncode
-        self.log.close()
+        try:
+            self.log.close()
+        except (OSError, ValueError):
+            pass
 
     def tail(self, n=40):
         try:
@@ -320,6 +353,35 @@ def main():
 
     signal.signal(signal.SIGTERM, on_sigterm)
 
+    ledger = Ledger() if (Ledger and not args.no_ledger) else None
+    # The subject is read on this thread and each victim on its own, so the
+    # ledger is fed from several. One lock, held only for the feed itself.
+    ledger_lock = threading.Lock()
+
+    def feed_victim(line):
+        """A line the victim printed.
+
+        Two things come out of it and both are counted. A [fuzz] line is the
+        victim saying what it READ, which is W13's whole point. Any line at
+        all is the weaker signal that is available when the victim is not
+        ours to build -- it said something after this case -- and that one is
+        counted for every line, including the [fuzz] ones, because a victim
+        that reports reach is still a victim that reacted.
+        """
+        if not ledger:
+            return
+        at = line.find(PREFIX)
+        obj = None
+        if at >= 0:
+            try:
+                obj = json.loads(line[at + len(PREFIX):])
+            except ValueError:
+                obj = None
+        with ledger_lock:
+            ledger.victim_line(line)
+            if isinstance(obj, dict) and "msg" in obj:
+                ledger.feed(obj, source="victim")
+
     victims = []
     for i, spec in enumerate(args.victim):
         vcmd = shlex.split(spec)
@@ -334,7 +396,7 @@ def main():
             log = f"{base}{i}{ext}"
         print(f"Victim {i}: {' '.join(vcmd)}  (output -> {log})")
         try:
-            victims.append(Victim(vcmd, log))
+            victims.append(Victim(vcmd, log, on_line=feed_victim))
         except OSError as exc:
             print(f"error: could not start a victim: {exc}", file=sys.stderr)
             for v in victims:
@@ -371,7 +433,6 @@ def main():
     progress = {}
     # Cases hostapd announced but never put on the air, per target.
     abandoned = {}
-    ledger = Ledger() if (Ledger and not args.no_ledger) else None
 
     # --quiet shows only fuzzing activity, which is right while a run is
     # working and wrong when it never starts: a config hostapd rejects then
@@ -423,7 +484,8 @@ def main():
                 return 2
 
             if ledger:
-                ledger.feed(obj)
+                with ledger_lock:
+                    ledger.feed(obj, source="subject")
 
             msg = obj.get("msg")
             target = obj.get("target")

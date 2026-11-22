@@ -21,6 +21,7 @@
 #include "rsn_supp/wpa_i.h"
 #include "drivers/driver.h"
 #include "l2_packet/l2_packet.h"
+#include "common/fuzz.h"
 
 #ifdef CONFIG_TDLS_TESTING
 #define TDLS_TESTING_LONG_FRAME BIT(0)
@@ -274,6 +275,7 @@ static int wpa_tdls_tpk_send(struct wpa_sm *sm, const u8 *dest, u8 action_code,
 			     int link_id)
 {
 	struct wpa_tdls_peer *peer;
+	u8 *fuzz_tx;
 
 	wpa_printf(MSG_DEBUG, "TDLS: TPK send dest=" MACSTR " action_code=%u "
 		   "dialog_token=%u status_code=%u peer_capab=%u initiator=%d "
@@ -281,13 +283,28 @@ static int wpa_tdls_tpk_send(struct wpa_sm *sm, const u8 *dest, u8 action_code,
 		   MAC2STR(dest), action_code, dialog_token, status_code,
 		   peer_capab, initiator, (unsigned int) msg_len);
 
+	/*
+	 * The only hooked path whose frames travel through a third party: the
+	 * AP relays them, so two parsers see every case -- the peer's and the
+	 * relay's. The body here is the TDLS payload that follows the Action
+	 * header the relay adds, so it carries an element chain of its own
+	 * from offset zero.
+	 */
+	fuzz_tx = apply_mutation_copy("sta-tdls", FUZZ_TYPE_FRAME_BODY, msg,
+				      &msg_len, FUZZ_HEADROOM, 0,
+				      FUZZ_CHAIN_ELEM);
+	if (fuzz_tx)
+		msg = fuzz_tx;
+
 	if (wpa_tdls_send_tpk_msg(sm, dest, action_code, dialog_token,
 				  status_code, peer_capab, initiator, msg,
 				  msg_len, link_id)) {
+		os_free(fuzz_tx);
 		wpa_printf(MSG_INFO, "TDLS: Failed to send message "
 			   "(action_code=%u)", action_code);
 		return -1;
 	}
+	os_free(fuzz_tx);
 
 	if (action_code == WLAN_TDLS_SETUP_CONFIRM ||
 	    action_code == WLAN_TDLS_TEARDOWN ||

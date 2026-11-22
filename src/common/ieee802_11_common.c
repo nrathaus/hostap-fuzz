@@ -15,6 +15,7 @@
 #include "qca-vendor.h"
 #include "ieee802_11_defs.h"
 #include "ieee802_11_common.h"
+#include "fuzz_reach.h"
 
 
 static int ieee802_11_parse_vendor_specific(const u8 *pos, size_t elen,
@@ -525,8 +526,14 @@ static ParseRes __ieee802_11_parse_elems(const u8 *start, size_t len,
 	const struct element *elem;
 	int unknown = 0;
 
-	if (!start)
+	if (!start) {
+		/* Nothing to walk, so nothing was read. Reported rather than
+		 * skipped: a caller that passes NULL is a frame whose chain
+		 * the layer above decided was not there, and a run where that
+		 * is every case is a run measuring nothing. */
+		fuzz_reach("elems", start, 0, 0);
 		return ParseOK;
+	}
 
 	for_each_element(elem, start, len) {
 		u8 id = elem->id, elen;
@@ -798,10 +805,15 @@ static ParseRes __ieee802_11_parse_elems(const u8 *start, size_t len,
 				   (int) (start + len - (const u8 *) elem));
 			wpa_hexdump(MSG_MSGDUMP, "IEs", start, len);
 		}
+		/* Where the walk stopped, which is the whole number: every
+		 * element behind this one was never visited, however many of
+		 * them the sender believed it was testing. */
+		fuzz_reach("elems", start, len, (const u8 *) elem - start);
 		return ParseFailed;
 	}
 
 done:
+	fuzz_reach("elems", start, len, len);
 	return unknown ? ParseUnknown : ParseOK;
 }
 

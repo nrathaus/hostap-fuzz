@@ -17,6 +17,7 @@
 #include "common/wpa_ctrl.h"
 #include "dpp.h"
 #include "dpp_i.h"
+#include "common/fuzz.h"
 
 #ifdef CONFIG_DPP2
 
@@ -263,6 +264,53 @@ static int dpp_tcp_send(struct dpp_connection *conn)
 		conn->write_eloop = 0;
 		return -1;
 	}
+
+#ifdef CONFIG_FUZZ
+	/*
+	 * DPP over TCP, which is the one place on this product where the
+	 * length domain is NOT bounded by the maximum MMPDU: the peer reads a
+	 * four-octet big-endian length and then that many octets, so the same
+	 * resize contract sweeps 0..64 KiB here against 0..2,304 everywhere
+	 * else. Nothing in the harness had touched this path.
+	 *
+	 * Only before the first octet of a message goes out. The send below
+	 * is a partial-write loop, and mutating a buffer the peer has already
+	 * read half of would change octets that are no longer in play and
+	 * report them as if they were.
+	 *
+	 * Worth saying plainly: a case that changes the LENGTH of a message
+	 * leaves the stream's own length prefix describing the old one, so
+	 * the peer's framing desynchronises and the connection is done. That
+	 * is a case worth sending once, and it costs a session each time --
+	 * which is B2 on a socket rather than a surprise.
+	 */
+	if (conn->msg_out_pos == 0 && fuzz_enabled()) {
+		size_t len = wpabuf_len(conn->msg_out);
+		/* No chain offset, and so no chain format that would matter:
+		 * this socket carries several encapsulations whose prefixes
+		 * differ -- dpp_tcp_encaps() writes a length, an action code
+		 * and DPP_HDR_LEN octets of header, and the Controller's own
+		 * messages do not -- so where the attributes begin is not
+		 * something this call site can state. Saying FUZZ_CHAIN_DPP
+		 * with the wrong offset would be worse than saying nothing:
+		 * the engine would synthesise attributes into the framing. */
+		u8 *mutated = apply_mutation_copy(
+			"dpp-tcp", FUZZ_TYPE_OCTET_STREAM,
+			wpabuf_head_u8(conn->msg_out), &len,
+			FUZZ_STREAM_HEADROOM, len, FUZZ_CHAIN_ELEM);
+
+		if (mutated) {
+			struct wpabuf *out = wpabuf_alloc_copy(mutated, len);
+
+			os_free(mutated);
+			if (out) {
+				wpabuf_free(conn->msg_out);
+				conn->msg_out = out;
+			}
+		}
+	}
+#endif /* CONFIG_FUZZ */
+
 	res = send(conn->sock,
 		   wpabuf_head_u8(conn->msg_out) + conn->msg_out_pos,
 		   wpabuf_len(conn->msg_out) - conn->msg_out_pos, 0);

@@ -49,6 +49,20 @@ if ! "$STA" -v 2>&1 | grep -q 'fuzzing hooks are COMPILED IN'; then
 	echo "error: $STA has no fuzzing hooks; build it from defconfig-fuzz" >&2
 	exit 2
 fi
+
+# A victim that reports what it READ is what tells a case space that is
+# sweeping from one that is being discarded at the door. That is a DIFFERENT
+# flag from CONFIG_FUZZ -- a reach build mutates nothing and transmits
+# exactly what a stock build transmits -- so it is not the check above, and
+# it is a note rather than a requirement. A run without it still works, and
+# the ledger says NOT MEASURED instead of reporting a zero it cannot read.
+if "$AP" -v 2>&1 | grep -q 'Reach instrumentation is COMPILED IN'; then
+	echo "victim: reports what it read"
+else
+	echo "victim: NOT instrumented, so this run cannot say what it read."
+	echo "  Build one:  cd hostapd && cp defconfig .config &&"
+	echo "              echo CONFIG_FUZZ_REACH=y >> .config && make"
+fi
 if [ ! -d /sys/module/mac80211_hwsim ]; then
 	echo "error: mac80211_hwsim is not loaded." >&2
 	echo "  sudo modprobe mac80211_hwsim radios=0" >&2

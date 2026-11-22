@@ -448,6 +448,10 @@ static void mesh_mpm_send_plink_action(struct wpa_supplicant *wpa_s,
 	len = wpabuf_len(buf);
 
 	/*
+	 * The buffer begins at the Category field -- WLAN_ACTION_SELF_PROTECTED
+	 * is the first octet put into it above -- so it is an ACTION_BODY and
+	 * the generated layout table can name what follows.
+	 *
 	 * Mesh peering is the third transmit direction, after AP to station
 	 * and station to AP: both ends of it are peers running this same code,
 	 * and nothing in the harness pointed at it until now.
@@ -460,7 +464,7 @@ static void mesh_mpm_send_plink_action(struct wpa_supplicant *wpa_s,
 	 * label over both would hide which of the two a run actually had.
 	 */
 	if (ampe) {
-		apply_mutation("mesh-plink-ampe", FUZZ_TYPE_FRAME_BODY,
+		apply_mutation("mesh-plink-ampe", FUZZ_TYPE_ACTION_BODY,
 			       wpabuf_mhead_u8(buf), len);
 
 		if (mesh_rsn_protect_frame(wpa_s->mesh_rsn, sta, cat, buf)) {
@@ -471,7 +475,7 @@ static void mesh_mpm_send_plink_action(struct wpa_supplicant *wpa_s,
 		len = wpabuf_len(buf);
 	} else {
 		len = apply_mutation_elements("mesh-plink",
-					      FUZZ_TYPE_FRAME_BODY,
+					      FUZZ_TYPE_ACTION_BODY,
 					      wpabuf_mhead_u8(buf), len,
 					      wpabuf_size(buf), chain_off);
 	}

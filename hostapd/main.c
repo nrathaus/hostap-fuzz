@@ -19,6 +19,7 @@
 #include "crypto/random.h"
 #include "crypto/tls.h"
 #include "common/version.h"
+#include "common/fuzz.h"
 #include "common/dpp.h"
 #include "common/proc_coord.h"
 #include "drivers/driver.h"
@@ -197,6 +198,7 @@ static int hostapd_driver_init(struct hostapd_iface *iface)
 			os_memcpy(hapd->own_addr, h_hapd->mld->mld_addr,
 				  ETH_ALEN);
 			random_mac_addr_keep_oui(hapd->own_addr);
+			fuzz_source_addr("own-ap-mld-link", hapd->own_addr);
 		} else {
 			os_memcpy(hapd->own_addr, b, ETH_ALEN);
 		}
@@ -319,10 +321,12 @@ pre_setup_mld:
 	if (hapd->conf->mld_ap) {
 		os_memcpy(hapd->mld->mld_addr, hapd->own_addr, ETH_ALEN);
 
-		if (!b)
+		if (!b) {
 			random_mac_addr_keep_oui(hapd->own_addr);
-		else
+			fuzz_source_addr("own-ap-mld", hapd->own_addr);
+		} else {
 			os_memcpy(hapd->own_addr, b, ETH_ALEN);
+		}
 
 		wpa_printf(MSG_DEBUG, "Setup of first link (%d) BSS of MLD %s",
 			   hapd->mld_link_id, hapd->conf->iface);
@@ -615,6 +619,13 @@ static void show_version(void)
 		"frames it transmits and must not be used as a real AP.\n"
 		"Set FUZZ_DISABLE=1 to run it unmodified.\n");
 #endif /* CONFIG_FUZZ */
+#ifdef CONFIG_FUZZ_REACH
+	fprintf(stderr,
+		"Reach instrumentation is COMPILED IN: this build reports how\n"
+		"far its own parsers got through what it was sent. It mutates\n"
+		"nothing and is safe to use as a victim.\n"
+		"Set FUZZ_REACH_DISABLE=1 to run it silent.\n");
+#endif /* CONFIG_FUZZ_REACH */
 }
 
 

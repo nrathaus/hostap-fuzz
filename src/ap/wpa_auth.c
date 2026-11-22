@@ -2197,7 +2197,11 @@ void __wpa_send_eapol(struct wpa_authenticator *wpa_auth,
 	if (!mic_len && encr)
 		len += AES_BLOCK_SIZE;
 
-	hdr = os_zalloc(len);
+	/* Room for the frame's length to be a domain of its own rather than a
+	 * constant: the station bounds the declared length with '>' and not
+	 * '==', so a frame longer than it says it is is accepted and parsed.
+	 * Zero without CONFIG_FUZZ, and the allocation is then what it was. */
+	hdr = os_zalloc(len + FUZZ_HEADROOM);
 	if (!hdr)
 		return;
 	hdr->version = conf->eapol_version;
@@ -2338,8 +2342,8 @@ void __wpa_send_eapol(struct wpa_authenticator *wpa_auth,
 	 * at once the record has to say which one this case went to, so the
 	 * call site says. */
 	fuzz_peer_hint(wpa_auth_get_spa(sm));
-	apply_mutation_defer_log("eapol", FUZZ_TYPE_IEEE802_1X_HDR, (u8 *) hdr,
-				 len);
+	len = apply_mutation_defer_log("eapol", FUZZ_TYPE_IEEE802_1X_HDR,
+				       (u8 *) hdr, len, len + FUZZ_HEADROOM);
 
 	if (key_info & WPA_KEY_INFO_MIC) {
 		if (!sm->PTK_valid || !mic_len) {

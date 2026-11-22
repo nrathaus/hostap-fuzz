@@ -98,6 +98,7 @@ int wpa_eapol_key_send(struct wpa_sm *sm, struct wpa_ptk *ptk,
 	int ret = -1;
 	size_t mic_len = wpa_mic_len(sm->key_mgmt, sm->pmk_len, sm->hash_alg,
 				     sm->pasn_group);
+	size_t fuzz_capacity = msg_len;
 
 	wpa_printf(MSG_DEBUG, "WPA: Send EAPOL-Key frame to " MACSTR
 		   " ver=%d mic_len=%d key_mgmt=0x%x",
@@ -120,6 +121,37 @@ int wpa_eapol_key_send(struct wpa_sm *sm, struct wpa_ptk *ptk,
 		}
 	}
 
+	/*
+	 * Room for the frame's length to be a domain of its own. The AP
+	 * bounds the declared length with '>' and not '==', so a frame longer
+	 * than it says it is is accepted and parsed -- which makes the length
+	 * a domain here rather than a constant.
+	 *
+	 * The buffer is this function's to free, so it is this function's to
+	 * grow; key_mic is a pointer INTO it and is rebased rather than left
+	 * dangling. Only on the MIC path: the AEAD branch below re-derives
+	 * the key data length by subtracting the headers from the frame's
+	 * length, and a shortened frame makes that subtraction underflow in
+	 * the TRANSMITTER, which is a crash in the fuzzer and not a finding.
+	 */
+#ifdef CONFIG_FUZZ
+	if (fuzz_enabled() && mic_len) {
+		/* Taken BEFORE the reallocation: subtracting from a pointer
+		 * the allocator may already have freed is undefined, however
+		 * reliably it would work. */
+		size_t mic_at = key_mic ? (size_t) (key_mic - msg) : 0;
+		u8 *grown = os_realloc(msg, msg_len + FUZZ_HEADROOM);
+
+		if (grown) {
+			if (key_mic)
+				key_mic = grown + mic_at;
+			msg = grown;
+			os_memset(msg + msg_len, 0, FUZZ_HEADROOM);
+			fuzz_capacity = msg_len + FUZZ_HEADROOM;
+		}
+	}
+#endif /* CONFIG_FUZZ */
+
 	/* The supplicant's own EAPOL-Key frames -- message 2 and 4 of the
 	 * four-way handshake, and the group handshake's reply -- which travel
 	 * station to AP and so are read by a different set of parsers than
@@ -130,8 +162,9 @@ int wpa_eapol_key_send(struct wpa_sm *sm, struct wpa_ptk *ptk,
 	 * field is parsed. The hexdump is held back until the frame is final,
 	 * because the FILS branch below replaces the buffer outright. */
 	fuzz_peer_hint(dest);
-	apply_mutation_defer_log("sta-eapol", FUZZ_TYPE_IEEE802_1X_HDR,
-				 msg, msg_len);
+	msg_len = apply_mutation_defer_log("sta-eapol",
+					   FUZZ_TYPE_IEEE802_1X_HDR,
+					   msg, msg_len, fuzz_capacity);
 
 	if (mic_len) {
 		if (key_mic && (!ptk || !ptk->kck_len))

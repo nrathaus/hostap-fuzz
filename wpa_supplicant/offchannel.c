@@ -15,6 +15,7 @@
 #include "p2p_supplicant.h"
 #include "driver_i.h"
 #include "offchannel.h"
+#include "common/fuzz.h"
 
 
 
@@ -267,6 +268,8 @@ int offchannel_send_action(struct wpa_supplicant *wpa_s, unsigned int freq,
 					 result),
 			   int no_cck)
 {
+	u8 *fuzz_tx = NULL;
+
 	wpa_printf(MSG_DEBUG, "Off-channel: Send action frame: freq=%d dst="
 		   MACSTR " src=" MACSTR " bssid=" MACSTR " len=%d",
 		   freq, MAC2STR(dst), MAC2STR(src), MAC2STR(bssid),
@@ -283,15 +286,28 @@ int offchannel_send_action(struct wpa_supplicant *wpa_s, unsigned int freq,
 				wpa_s->pending_action_tx);
 		wpabuf_free(wpa_s->pending_action_tx);
 	}
+	/*
+	 * The station side of DPP, P2P, NAN and GAS all converge here, with
+	 * seventy-six call sites between them and no hook on any of their
+	 * transmit paths until now. The label is read out of the frame rather
+	 * than written here, so those four arrive as their own targets from
+	 * this one site -- and so do the protocols that reach it next year.
+	 */
+	fuzz_tx = fuzz_action_mutate(buf, &len);
+	if (fuzz_tx)
+		buf = fuzz_tx;
+
 	wpa_s->pending_action_tx_done = 0;
 	wpa_s->pending_action_tx = wpabuf_alloc(len);
 	if (wpa_s->pending_action_tx == NULL) {
 		wpa_printf(MSG_DEBUG, "Off-channel: Failed to allocate Action "
 			   "frame TX buffer (len=%llu)",
 			   (unsigned long long) len);
+		os_free(fuzz_tx);
 		return -1;
 	}
 	wpabuf_put_data(wpa_s->pending_action_tx, buf, len);
+	os_free(fuzz_tx);
 	os_memcpy(wpa_s->pending_action_src, src, ETH_ALEN);
 	os_memcpy(wpa_s->pending_action_dst, dst, ETH_ALEN);
 	os_memcpy(wpa_s->pending_action_bssid, bssid, ETH_ALEN);

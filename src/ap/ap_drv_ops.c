@@ -25,6 +25,7 @@
 #include "robust_av.h"
 #include "beacon.h"
 #include "ap_drv_ops.h"
+#include "common/fuzz.h"
 
 
 u32 hostapd_sta_flags_to_drv(u32 flags)
@@ -1054,6 +1055,8 @@ static int hapd_drv_send_action(struct hostapd_data *hapd, unsigned int freq,
 	};
 	struct sta_info *sta;
 	int link_id = -1;
+	u8 *fuzz_tx;
+	int ret;
 
 	if (!hapd->driver || !hapd->driver->send_action || !hapd->drv_priv)
 		return 0;
@@ -1092,9 +1095,27 @@ static int hapd_drv_send_action(struct hostapd_data *hapd, unsigned int freq,
 #endif /* CONFIG_IEEE80211BE */
 	}
 
-	return hapd->driver->send_action(hapd->drv_priv, freq, wait, dst,
-					 own_addr, bssid, data, len, 0,
-					 link_id);
+	/*
+	 * The AP side of DPP, GAS, RRM, robust-AV, HS20 and WNM converges
+	 * here -- fifty-seven call sites -- and nothing had a hook on any of
+	 * them. The label is read out of the frame, so each of those arrives
+	 * as its own target from this one site.
+	 *
+	 * This is hapd_drv_send_action() and not hostapd_drv_send_action():
+	 * three exported wrappers funnel into it, and hooking the one the
+	 * plan named would have left the addr3 and forced-addr3 paths unhooked
+	 * with nothing in the ledger saying so.
+	 */
+	fuzz_tx = fuzz_action_mutate(data, &len);
+	if (fuzz_tx)
+		data = fuzz_tx;
+
+	ret = hapd->driver->send_action(hapd->drv_priv, freq, wait, dst,
+					own_addr, bssid, data, len, 0,
+					link_id);
+	os_free(fuzz_tx);
+
+	return ret;
 }
 
 

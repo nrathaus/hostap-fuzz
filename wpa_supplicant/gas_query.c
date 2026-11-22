@@ -15,6 +15,7 @@
 #include "common/ieee802_11_defs.h"
 #include "common/gas.h"
 #include "common/wpa_ctrl.h"
+#include "common/fuzz.h"
 #include "rsn_supp/wpa.h"
 #include "wpa_supplicant_i.h"
 #include "config.h"
@@ -884,17 +885,22 @@ static int gas_query_set_sa(struct gas_query *gas,
 		return 0;
 	}
 
-	if (wpa_s->conf->gas_rand_mac_addr == 1 &&
-	    random_mac_addr(gas->rand_addr) < 0) {
-		wpa_printf(MSG_ERROR, "GAS: Failed to get random address");
-		return -1;
+	if (wpa_s->conf->gas_rand_mac_addr == 1) {
+		if (random_mac_addr(gas->rand_addr) < 0) {
+			wpa_printf(MSG_ERROR,
+				   "GAS: Failed to get random address");
+			return -1;
+		}
+		fuzz_source_addr("own-gas", gas->rand_addr);
 	}
 
-	if (wpa_s->conf->gas_rand_mac_addr == 2 &&
-	    random_mac_addr_keep_oui(gas->rand_addr) < 0) {
-		wpa_printf(MSG_ERROR,
-			   "GAS: Failed to get random address with same OUI");
-		return -1;
+	if (wpa_s->conf->gas_rand_mac_addr == 2) {
+		if (random_mac_addr_keep_oui(gas->rand_addr) < 0) {
+			wpa_printf(MSG_ERROR,
+				   "GAS: Failed to get random address with same OUI");
+			return -1;
+		}
+		fuzz_source_addr("own-gas", gas->rand_addr);
 	}
 
 	wpa_printf(MSG_DEBUG, "GAS: Use a new random transmitter address "

@@ -237,9 +237,13 @@ def run(binary, target, type_value, iterations, frame=BODY, capacity=None):
 def check_frame_kind(root, binary, check):
     print("\nEvery mutation says what it mutated")
     members = enum_members(root)
-    check.ok(len(members) == 3,
-             "fuzz_frame_type has the three kinds the tree uses (%d)"
-             % len(members),
+    # Not a count. Every member is driven below and every one has to produce
+    # mutations under a single, distinguishable name -- so a kind added
+    # upstream or here is checked by this block the moment it exists, which a
+    # literal three would have turned into a failure to be edited away.
+    check.ok(len(members) >= 3,
+             "fuzz_frame_type has a kind per header the tree mutates (%d: %s)"
+             % (len(members), ", ".join(n for n, _ in members)),
              str(members))
 
     kinds = {}
@@ -267,11 +271,18 @@ def check_frame_kind(root, binary, check):
     check.ok(len(set(kinds.values())) == len(kinds),
              "the kinds are distinguishable from each other: %s"
              % sorted(v for v in kinds.values() if v))
-    check.ok(kinds.get("FUZZ_TYPE_IEEE80211_MGMT") == "mgmt" and
-             kinds.get("FUZZ_TYPE_IEEE802_1X_HDR") == "eapol" and
-             kinds.get("FUZZ_TYPE_FRAME_BODY") == "body",
+    want = {"FUZZ_TYPE_IEEE80211_MGMT": "mgmt",
+            "FUZZ_TYPE_IEEE802_1X_HDR": "eapol",
+            "FUZZ_TYPE_FRAME_BODY": "body",
+            "FUZZ_TYPE_ACTION_BODY": "action",
+            "FUZZ_TYPE_OCTET_STREAM": "stream"}
+    check.ok(all(kinds.get(k) == v for k, v in want.items()
+                 if k in dict(members)),
              "and they are the names the consumers switch on",
              str(kinds))
+    check.ok(all(n in want for n, _ in members),
+             "every kind has a name a consumer was told about",
+             str([n for n, _ in members if n not in want]))
 
     # The header skip is a property of the kind, not of the label. A body has
     # no header, so nothing in it is held back from the sweep.
@@ -663,8 +674,9 @@ def check_handover(root, check):
                  "the ledger reports a log with no hostap source beside it")
         check.ok("Traceback" not in rc.stderr,
                  "without a traceback")
-        check.ok("1 of 2 reached" in rc.stdout,
-                 "and still says which targets were reached")
+        check.ok("1 reached, 1 never reached" in rc.stdout,
+                 "and still says which targets were reached, and which of the"
+                 " unreached are in a binary that ran")
         check.ok("02:00:00:00:01:00" in rc.stdout,
                  "and which peer received the case")
         check.ok("No checkout" in rc.stdout,

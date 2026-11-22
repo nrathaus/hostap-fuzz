@@ -205,6 +205,13 @@ def member_fields(body, consts):
                     n = int(bound)
                 except ValueError:
                     return None, False
+            if n == 0:
+                # The other spelling of the same thing. 'u8 variable[0]' is
+                # a flexible array member in the older idiom, and reading it
+                # as a zero-width field puts a field of no octets in the
+                # table and hides the chain that follows it.
+                flexible = True
+                continue
             if SCALARS[base] != 1:
                 return None, False        # not in these structs; not guessed
             width = n

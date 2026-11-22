@@ -234,10 +234,14 @@ static int ieee802_11_send_wnmsleep_resp(struct hostapd_data *hapd,
 	/* The element chain starts after the key data, whose length only this
 	 * function knows: the subelements before it are not elements of the
 	 * chain. hostapd_drv_send_action() is handed the action body and the
-	 * driver supplies the header, so this is a FRAME_BODY and no octets
-	 * are reserved. */
+	 * driver supplies the header, so no octets are reserved -- and the
+	 * body begins at the Category field, which is what ACTION_BODY says
+	 * and FRAME_BODY did not. The generated layout table reads the
+	 * category and the code after it, so saying which this is gives the
+	 * engine the frame's named fields; saying only "a body" left
+	 * keydata_len as three unnamed octets of the byte sweep. */
 	len = apply_mutation_elements(
-		"wnm-sleep-resp", FUZZ_TYPE_FRAME_BODY,
+		"wnm-sleep-resp", FUZZ_TYPE_ACTION_BODY,
 		&mgmt->u.action.category, len, mgmt_capacity,
 		(u8 *) mgmt->u.action.u.wnm_sleep_resp.variable -
 		&mgmt->u.action.category +
@@ -442,8 +446,10 @@ static int ieee802_11_send_bss_trans_mgmt_request(struct hostapd_data *hapd,
 		   mgmt->u.action.u.bss_tm_req.validity_interval);
 
 	len = pos - &mgmt->u.action.category;
+	/* An Action body, starting at the Category field: the kind is what
+	 * lets the generated layout table name this frame's fixed fields. */
 	len = apply_mutation_elements(
-		"wnm-bss-tm-req", FUZZ_TYPE_FRAME_BODY,
+		"wnm-bss-tm-req", FUZZ_TYPE_ACTION_BODY,
 		&mgmt->u.action.category, len,
 		sizeof(*mgmt) + FUZZ_HEADROOM -
 		((u8 *) &mgmt->u.action.category - (u8 *) mgmt),

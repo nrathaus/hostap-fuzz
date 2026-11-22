@@ -21,6 +21,7 @@ complete but unreachable is the same as a domain that is missing.
 """
 
 import json
+import re
 import os
 import subprocess
 import sys
@@ -170,7 +171,7 @@ def run(binary, target, iterations, frame=FRAME, capacity=CAPACITY,
     return frames[WARMUP:], messages
 
 
-fuzz_ids = (None, None)
+fuzz_ids = (None, None, None)
 
 
 def registries(root):
@@ -179,8 +180,16 @@ def registries(root):
     global fuzz_ids
     data = reg.extract(root)
     fuzz_ids = (sorted(data["element id"]),
-                sorted(data["element id extension"]))
+                sorted(data["element id extension"]),
+                sorted(data["extended length element id"]))
     return fuzz_ids
+
+
+def shapes(root):
+    """The element shape table, as the engine gets it: from the tree."""
+    sys.path.insert(0, os.path.join(root, "fuzzing", "ledger"))
+    import registries as reg
+    return reg.shapes(root)
 
 
 def elems(messages):
@@ -188,17 +197,75 @@ def elems(messages):
             if m.get("msg") == "fuzz" and m.get("type") == "MUT_ELEM"]
 
 
+SHAPE_BY_ID = {}
+SHAPE_HDRS = []
+# The widest header any shape has, which is what the engine calls
+# FUZZ_ELEM_OVERHEAD. Taken from the generated table rather than typed, so a
+# fourth shape with a wider header moves it here too.
+ELEM_OVERHEAD = 0
+
+
 def walk(body):
-    """[(id, length, ext_id or None)], or None if it is not a clean chain."""
+    """[(id, declared length, sub id or None)], or None if it is not a clean
+    chain.
+
+    Shape-aware, because the tree is: an element's header is two octets for
+    most ids, three for the extension id and five -- with a little-endian u16
+    length -- for the extended length id. A two-octet walk over a chain
+    containing one of the latter reads a length out of octets that are not the
+    length field, and then reports a correctly built chain as broken. The
+    table comes from the checkout, so this walker cannot drift from the
+    engine's.
+    """
     out, pos = [], 0
-    while pos + 2 <= len(body):
-        eid, elen = body[pos], body[pos + 1]
-        if pos + 2 + elen > len(body):
+    basic = {"hdr": 2, "len_off": 1, "len_width": 1, "len_le": False,
+             "ext_off": 0, "ext_width": 0, "ext_le": False, "covers": False}
+    while pos < len(body):
+        eid = body[pos]
+        sh = SHAPE_BY_ID.get(eid, basic)
+        hdr = (sh["len_off"] + sh["len_width"]) if sh["covers"] else sh["hdr"]
+        if pos + hdr > len(body):
             return None
-        ext = body[pos + 2] if eid == 255 and elen >= 1 else None
-        out.append((eid, elen, ext))
-        pos += 2 + elen
+        elen = int.from_bytes(
+            body[pos + sh["len_off"]:pos + sh["len_off"] + sh["len_width"]],
+            "little" if sh["len_le"] else "big")
+        if pos + hdr + elen > len(body):
+            return None
+        sub = None
+        if sh["ext_width"]:
+            room = elen if sh["covers"] else len(body) - pos - sh["ext_off"]
+            if room >= sh["ext_width"]:
+                at = pos + sh["ext_off"]
+                sub = int.from_bytes(body[at:at + sh["ext_width"]],
+                                     "little" if sh["ext_le"] else "big")
+        out.append((eid, elen, sub))
+        pos += hdr + elen
     return out if pos == len(body) else None
+
+
+def load_shape_table(root):
+    global ELEM_OVERHEAD
+    info = shapes(root)
+    SHAPE_HDRS[:] = info["shapes"]
+    ELEM_OVERHEAD = max(sh["hdr"] for sh in info["shapes"])
+    sys.path.insert(0, os.path.join(root, "fuzzing", "ledger"))
+    import registries as reg
+    defined = reg.extract(root)
+    for sh in info["shapes"]:
+        if sh["sel"] is None:
+            continue
+        for members in defined.values():
+            for val, names in members.items():
+                if sh["sel"] in names:
+                    SHAPE_BY_ID[val] = {
+                        "hdr": sh["hdr"], "len_off": sh["len_off"],
+                        "len_width": sh["len_width"],
+                        "len_le": bool(sh["len_le"]),
+                        "ext_off": sh["extid_off"],
+                        "ext_width": sh["extid_width"],
+                        "ext_le": bool(sh["extid_le"]),
+                        "covers": bool(sh["covers"]),
+                    }
 
 
 def check_registry_fresh(root, check):
@@ -209,35 +276,99 @@ def check_registry_fresh(root, check):
     check.ok(rc.returncode == 0,
              "the generated registry header matches ieee802_11_defs.h",
              rc.stdout.strip()[:300])
-    ids, ext = registries(root)
-    check.ok(len(ids) == 179 and len(ext) == 62,
-             "179 element ids and 62 extension ids (%d, %d)"
-             % (len(ids), len(ext)))
+    ids, ext, extlen = registries(root)
+    # Membership is decided by the SECTION of the header a define sits in,
+    # not by its name. Four constants named WLAN_EID_EXT_* are element ids
+    # and one is a member of a third registry, so a longest-prefix rule gets
+    # five of them wrong in both directions at once: it files four element
+    # ids as extension ids -- where they are never built as element ids at
+    # all -- and emits five numbers as extension ids that the extension
+    # registry does not contain.
+    check.ok(len(ids) == 183 and len(ext) == 57 and len(extlen) == 1,
+             "183 element ids, 57 extension ids and %d extended length id(s) "
+             "(%d, %d, %d)" % (len(extlen), len(ids), len(ext), len(extlen)))
+    misfiled = {50, 60, 127, 227}
+    check.ok(misfiled <= set(ids) and not (misfiled & set(ext)),
+             "the element ids whose names carry the extension registry's "
+             "prefix are element ids: %s" % sorted(misfiled))
+
+    sh = shapes(root)
+    names = [x["name"] for x in sh["shapes"]]
+    widths = {x["name"]: x["len_width"] for x in sh["shapes"]}
+    check.ok(len(names) == 3 and widths.get("EXTLEN") == 2,
+             "three element shapes, one of them with a two-octet length "
+             "field (%s)" % ", ".join("%s/%d" % (n, widths[n])
+                                      for n in names))
+
+
+def check_headroom_floor(root, check):
+    """The engine's headroom floor is the widest header the table has.
+
+    It is a number in fuzz.c and the table is generated, so the two can part
+    company: a fourth shape with a six-octet header would leave the floor at
+    five, and the element domains would be sized for a staging buffer that
+    cannot hold one header. Checked rather than remembered.
+    """
+    print("\nThe headroom floor and the table agree")
+    src = os.path.join(root, "src", "common", "fuzz.c")
+    with open(src, encoding="utf-8") as f:
+        text = f.read()
+    m = re.search(r"#define\s+FUZZ_ELEM_OVERHEAD\s+(\d+)", text)
+    check.ok(m is not None, "fuzz.c states a headroom floor")
+    check.ok(m is not None and int(m.group(1)) == ELEM_OVERHEAD,
+             "and it is the widest header of any shape (%s against %d)"
+             % (m.group(1) if m else "none", ELEM_OVERHEAD))
 
 
 def check_every_id(root, check, binary):
     print("\nEvery id is built, and built early")
-    ids, ext = registries(root)
-    total = len(ids) + len(ext)
+    ids, ext, extlen = registries(root)
+    total = len(ids) + len(ext) + len(extlen)
 
     # Identity varies fastest, so one case per id in the element domain is
     # enough -- but the round robin shares the run with the other domains, so
     # the run has to be long enough for the element domain to get that many
-    # turns. Five domains, so roughly five times.
-    _, msgs = run(binary, "t-ids", total * 6)
-    seen_eid = {m["eid"] for m in elems(msgs) if "eid" in m}
-    seen_ext = {m["ext_id"] for m in elems(msgs) if "ext_id" in m}
+    # turns. Ten domains, so roughly ten times.
+    _, msgs = run(binary, "t-ids", total * 12)
+    e = elems(msgs)
+    seen_eid = {m["eid"] for m in e if "eid" in m}
+    # A sub-registry member counts only when the declared length reached far
+    # enough to carry it. The length domain contains values that do not, and
+    # counting those would report a member the frame did not have.
+    seen_ext = {m["ext_id"] for m in e
+                if "ext_id" in m and m.get("present") != 0}
+    seen_extlen = {m["extlen_id"] for m in e
+                   if "extlen_id" in m and m.get("present") != 0}
 
     check.ok(seen_eid == set(ids),
              "every one of the %d element ids is synthesised (%d)"
              % (len(ids), len(seen_eid)),
              "missing: %s" % sorted(set(ids) - seen_eid)[:10])
-    check.ok(seen_ext == set(ext),
-             "every one of the %d extension ids is synthesised (%d)"
+    # A subset, not an equality: the element id segment builds id 255 and id
+    # 227 under their real shapes without choosing a member of the registry
+    # those shapes carry, so a zero goes where the member would be. Zero is a
+    # member of one of the two registries and of neither prefix rule, and the
+    # case is worth sending either way -- what must not happen is a member
+    # going UNSENT.
+    check.ok(set(ext) <= seen_ext,
+             "every one of the %d extension ids is synthesised (%d sent)"
              % (len(ext), len(seen_ext)),
              "missing: %s" % sorted(set(ext) - seen_ext)[:10])
-    check.ok(len(elems(msgs)) >= total,
-             "within %d cases, which is what a short run gets" % (total * 6))
+    check.ok(set(extlen) <= seen_extlen,
+             "and every one of the %d extended length ids (%d sent)"
+             % (len(extlen), len(seen_extlen)),
+             "missing: %s" % sorted(set(extlen) - seen_extlen)[:10])
+    check.ok(len(e) >= total,
+             "within %d cases, which is what a short run gets" % (total * 12))
+
+    # Shape is not optional. An id built under the wrong shape still goes out,
+    # still gets counted, and reports coverage of a length field the parser
+    # never read -- so the check is that each of the three is actually built,
+    # not merely that the table has three rows.
+    built = {m.get("shape") for m in e}
+    check.ok(built >= {"BASIC", "EXT", "EXTLEN"},
+             "all three shapes are built, not just the two-octet one (%s)"
+             % ", ".join(sorted(x for x in built if x)))
 
 
 def check_in_the_frame(check, binary):
@@ -251,10 +382,15 @@ def check_in_the_frame(check, binary):
         at, was, now = m["at"], m["was"], m["len"]
         if now == was:
             continue                        # did not fit; reported as such
+        # A nested element is not the first thing inserted -- its containers
+        # are. The engine reports where the inner one landed, which is the
+        # whole reason that key exists.
+        if m.get("depth"):
+            at = m["nest_at"]
         inserted = data[at:at + (now - was)]
-        want = m.get("eid", 255)
+        want = m["eid"]
         if not inserted or inserted[0] != want:
-            bad.append((m.get("eid"), m.get("ext_id"), inserted[:4].hex()))
+            bad.append((m.get("dom"), m.get("eid"), inserted[:6].hex()))
     check.ok(checked, "element cases ran (%d)" % checked)
     check.ok(not bad,
              "each one's octets are at the offset the message gives, "
@@ -290,32 +426,45 @@ def check_structure(check, binary):
     for m in elems(msgs):
         if m["len"] == m["was"]:
             continue
-        if "ext_id" in m:
-            # id 255, length = body + 1, then the extension id
-            want_len = m["body"] + 1
-        else:
-            want_len = m["body"]
-        if want_len > 255:
-            bad.append(("length out of range", m.get("body")))
-    check.ok(not bad, "no element claims a length a length octet cannot hold",
+        sh = SHAPE_BY_ID.get(m.get("eid"))
+        domain = 1 << (8 * (sh["len_width"] if sh else 1))
+        if m.get("declared", 0) >= domain:
+            bad.append(("length out of range", m.get("shape"),
+                        m.get("declared")))
+    check.ok(not bad,
+             "no element claims a length its own length field cannot hold "
+             "-- which for one shape is 65,535 and not 255",
              str(bad[:4]))
 
     frames, msgs = run(binary, "t-struct2", 600)
     chains = 0
     broken = []
+    lying = 0
     for (ret, data), m in pair(frames, msgs):
         if m is None or m.get("type") != "MUT_ELEM" or m["len"] == m["was"]:
             continue
+        if m.get("dom") in ("elen", "frag"):
+            # The declared-length domain's whole point is a length that does
+            # not describe what follows it, and a fragment run is a parent
+            # that declares everything its field can say. Requiring the chain
+            # to walk afterwards would be requiring those domains not to
+            # work.
+            lying += 1
+            continue
         walked = walk(data[CHAIN_OFF:])
         if walked is None:
-            broken.append((m.get("eid"), m.get("ext_id"), m.get("body")))
+            broken.append((m.get("eid"), m.get("shape"), m.get("declared"),
+                           m.get("body")))
         else:
             chains += 1
     check.ok(chains, "the frame still walks as a chain afterwards (%d)"
              % chains)
     check.ok(not broken,
-             "every synthesised element leaves a chain that walks exactly",
+             "every honestly-built element leaves a chain that walks exactly",
              str(broken[:4]))
+    check.ok(lying,
+             "and the domains whose point is a length that lies are counted "
+             "apart rather than called breakage (%d)" % lying)
 
 
 def check_position(check, binary):
@@ -346,21 +495,37 @@ def check_length_and_multiplicity(check, binary):
     # proved on a frame whose headroom is small enough for that to be quick
     # rather than on one where it would take a quarter of a million cases.
     small = HDR + FIXED + bytes([0xAA, 0xBB, 0xCC])
-    room = 10
-    ids, ext = len(fuzz_ids[0]), len(fuzz_ids[1])
-    want = room - 3 + 1
-    _, msgs = run(binary, "t-len", (ids + ext) * want * 6,
+    room = 12
+    nids = sum(len(x) for x in fuzz_ids)
+    # The headroom bound is the WIDEST header of any shape, not the narrowest,
+    # because the domain is one product over all the identities and a bound
+    # that moved with the shape would move case_max with it. The declared
+    # lengths that bound costs here are not lost: the declared-length domain
+    # sweeps the whole field on every shape.
+    overhead = max(x["hdr"] for x in SHAPE_HDRS)
+    want = room - overhead + 1
+    _, msgs = run(binary, "t-len", nids * want * 14,
                   frame=small, capacity=len(small) + room)
-    e = elems(msgs)
-    bodies = {m["body"] for m in e if m["copies"] == 1}
-    check.ok(bodies == set(range(want)),
-             "with %d octets of headroom the body length is swept over its "
-             "whole domain, 0..%d (%d distinct)"
-             % (room, want - 1, len(bodies)),
-             "missing: %s" % sorted(set(range(want)) - bodies)[:8])
-    check.ok(0 in bodies, "including an empty body")
+    e = [m for m in elems(msgs) if m.get("dom") == "elem"]
+    declared = {m["declared"] for m in e if m["copies"] == 1}
+    check.ok(declared == set(range(want)),
+             "with %d octets of headroom the declared length is swept over "
+             "its whole domain, 0..%d (%d distinct)"
+             % (room, want - 1, len(declared)),
+             "missing: %s" % sorted(set(range(want)) - declared)[:8])
+    check.ok(0 in declared, "including an empty body")
 
-    _, msgs = run(binary, "t-len2", 20000)
+    # The declared-length domain reaches past what the headroom holds, which
+    # is the point of it: what an element says about itself and what follows
+    # it are two different things, and for a two-octet length field the gap
+    # is up to 65,535 octets.
+    wide = [m for m in elems(msgs) if m.get("dom") == "elen"]
+    check.ok(any(m["declared"] > room for m in wide),
+             "and the declared length alone reaches past the headroom (max "
+             "%d with %d octets of room)"
+             % (max([m["declared"] for m in wide] or [0]), room))
+
+    _, msgs = run(binary, "t-len2", 30000)
     e = elems(msgs)
     copies = {m["copies"] for m in e}
     check.ok(copies >= {1, 2, 3, 4, 5},
@@ -464,12 +629,580 @@ def check_unchanged(check, binary):
              "none of the element domains run (%s)" % sorted(kinds))
 
 
+# ---------------------------------------------------------------------------
+# Shape, fragmentation and nesting.
+#
+# 5b built every id as "u8 id, u8 len, body", inserted into a flat chain.
+# Three things about the element layer in this tree make that one case out of
+# several rather than the general one, and all three land on domains 5b
+# already sweeps -- which is why none of them showed up as a failure. The
+# frame went out, the ledger counted the id, and the length domain the run
+# believed it swept was not the field the parser read.
+# ---------------------------------------------------------------------------
+
+# A chain containing all three shapes and a fragment group, so the walk has
+# something to be wrong about. Built from the shape table rather than typed,
+# for the same reason the engine's tables are generated: a hand-written chain
+# here would keep passing after the tree changed underneath it.
+def mixed_chain(root):
+    info = shapes(root)
+    byname = {x["name"]: x for x in info["shapes"]}
+    sel = {}
+    sys.path.insert(0, os.path.join(root, "fuzzing", "ledger"))
+    import registries as reg
+    defined = reg.extract(root)
+    for sh in info["shapes"]:
+        if sh["sel"] is None:
+            continue
+        for members in defined.values():
+            for val, names in members.items():
+                if sh["sel"] in names:
+                    sel[sh["name"]] = val
+    frag_id = None
+    for members in defined.values():
+        for val, names in members.items():
+            if info["frag_id"] in names:
+                frag_id = val
+
+    out = bytearray()
+    # basic
+    out += bytes([0, 2, 0x41, 0x41])
+    # extended length: id, le16 ext id, le16 datalen, body
+    x = byname["EXTLEN"]
+    e = bytearray(x["hdr"])
+    e[0] = sel["EXTLEN"]
+    e[x["extid_off"]:x["extid_off"] + x["extid_width"]] = \
+        (0).to_bytes(x["extid_width"], "little")
+    e[x["len_off"]:x["len_off"] + x["len_width"]] = \
+        (4).to_bytes(x["len_width"], "little")
+    out += bytes(e) + bytes(4)
+    # extension: id, len (covering the ext id), ext id, body
+    out += bytes([sel["EXT"], 3, 1]) + bytes(2)
+    # a fragmentable element and its continuation: the parent declares
+    # everything its length field can say, which is what makes the tree look
+    # for one.
+    out += bytes([1, info["frag_parent_len"]]) + bytes(info["frag_parent_len"])
+    out += bytes([frag_id, 4]) + bytes(4)
+    # and a trailing element, so "after the group" is a real position
+    out += bytes([3, 0])
+    # groups: basic, extlen, ext, (parent+fragment), trailing
+    return bytes(out), 5, frag_id
+
+
+def check_shapes(root, check, binary):
+    print("\nThree shapes, and the chain walk that knows them")
+    chain, ngroup, frag_id = mixed_chain(root)
+    frame = HDR + FIXED + chain
+    off = len(HDR) + len(FIXED)
+    cap = len(frame) + 2 + 255
+
+    # A flat two-octet walk over this chain is not merely less informative --
+    # it reads a length out of octets that are not the length field, so every
+    # offset after that point is arithmetic on unrelated bytes.
+    flat, pos = [], 0
+    while pos + 2 <= len(chain):
+        flat.append((chain[pos], chain[pos + 1]))
+        pos += 2 + chain[pos + 1]
+    shaped = walk(chain)
+    check.ok(shaped is not None,
+             "the shape-aware walk consumes a chain with all three shapes "
+             "exactly (%s)" % ("yes" if shaped else "no"))
+    check.ok(pos != len(chain) or len(flat) != len(shaped or []),
+             "and a two-octet walk of the same chain does not agree with it "
+             "(%d elements against %d)" % (len(flat), len(shaped or [])))
+
+    _, msgs = run(binary, "t-shape", 6000, frame=frame, capacity=cap,
+                  chain_off=off)
+    e = elems(msgs)
+    check.ok(e and all(m["npos"] == ngroup + 1 for m in e),
+             "a chain of %d groups has %d insertion points, not one per "
+             "element (%s)"
+             % (ngroup, ngroup + 1, e[0]["npos"] if e else "none"))
+
+    # The insertion points are between groups. Landing between a fragmentable
+    # element and its continuation terminates defragmentation and hands the
+    # consumer a truncated buffer -- and the chain still walks afterwards, so
+    # nothing would report it.
+    parent = off + chain.index(bytes([1, 255]))
+    inside = parent + 2 + 255
+    hit = sorted({m["at"] for m in e if m["at"] == inside})
+    check.ok(not hit,
+             "and none of them is inside a fragment group, where inserting "
+             "removes octets from an element without breaking the walk (%s)"
+             % hit)
+
+    # The declared length follows the shape. For the two-octet one that is a
+    # 65,536-value domain, which is why an element header needs the tiers.
+    byshape = {}
+    for m in e:
+        byshape.setdefault(m.get("shape"), set()).add(m.get("declared", 0))
+    check.ok(max(byshape.get("EXTLEN", {0})) > 255,
+             "an extended length element declares past 255 (%d), which a "
+             "one-octet length field cannot say"
+             % max(byshape.get("EXTLEN", {0})))
+    check.ok(all(v <= 255 for v in byshape.get("BASIC", {0})),
+             "and a basic element never does")
+    tiers = {m.get("tier") for m in e if m.get("dom") == "elen"}
+    check.ok("STRIDE" in tiers or "FULL" in tiers,
+             "the declared-length domain names its tier, as every domain "
+             "over 256 values in this engine does (%s)"
+             % ", ".join(sorted(x for x in tiers if x)))
+
+    # The window the extension shape has and the others do not: its declared
+    # length covers the extension id, so the bottom of the length domain is a
+    # frame carrying the shape without the id the identity domain selected.
+    window = [m for m in e
+              if m.get("shape") == "EXT" and m.get("present") == 0]
+    check.ok(window,
+             "a declared length below the extension id's width leaves it out "
+             "of the frame, and is reported as not sent (%d case(s))"
+             % len(window))
+    check.ok(all(m["declared"] < 1 for m in window),
+             "and that happens only below the minimum, not above it")
+
+
+def check_fragments_and_nesting(root, check, binary):
+    print("\nPast one element: fragments and nesting")
+    big = len(FRAME) + 4000
+    _, msgs = run(binary, "t-frag", 9000, capacity=big)
+    e = elems(msgs)
+
+    frag = [m for m in e if m.get("dom") == "frag"]
+    check.ok(frag, "fragment runs are built (%d)" % len(frag))
+    counts = sorted({m["nfrag"] for m in frag})
+    check.ok(len(counts) > 1,
+             "with the fragment count as the swept axis (%s)" % counts)
+    longest = max([m.get("deflen", 0) for m in frag] or [0])
+    check.ok(longest > 255,
+             "and the defragmented length passes what a one-octet length "
+             "field can say (%d octets), which is the only route there"
+             % longest)
+    check.ok(any(m.get("deflen", 0) < 255 * m["nfrag"] for m in frag),
+             "including the run that ends at a fragment declaring nothing, "
+             "which is where the walk stops")
+
+    nest = [m for m in e if m.get("dom") == "nest"]
+    check.ok(nest, "nested elements are built (%d)" % len(nest))
+    depths = sorted({m["depth"] for m in nest})
+    check.ok(depths == [1, 2],
+             "at both depths the domain has, and early rather than at the "
+             "end of a sweep no run finishes (%s)" % depths)
+    check.ok(all(m["nest_at"] > m["at"] for m in nest),
+             "and the inner element is inside its container, not beside it")
+
+
+def check_one_hostile_field(check, binary):
+    """W10. A case is a valid message with one hostile region, and the rest of
+    the message is still READ.
+
+    A walker that stops has not tested what was behind it. So an element whose
+    declared length does not match its body may only go last -- anywhere else
+    the overrun is absorbed by the element that follows, the walker's bound is
+    never reached, and every element behind it is skipped while the ledger
+    counts them as sent.
+
+    Nothing here trusts the engine's own account of which domain lies. Every
+    assertion is made against the octets that came out, re-walked here with
+    the shape table taken from the checkout.
+    """
+    print("\nOne hostile field, and the rest of the message still readable")
+    frames, msgs = run(binary, "t-w10", 6000)
+    cases = [(f, m) for f, m in pair(frames, msgs)
+             if m is not None and m.get("type") == "MUT_ELEM"]
+
+    missing = [m for _, m in cases
+               if m.get("walks") is None or m.get("tail") is None or
+               m.get("pre") is None or m.get("post") is None]
+    check.ok(cases and not missing,
+             "every element case reports whether it walks, whether it went "
+             "last, and how far a walker got before and after (%d case(s))"
+             % len(cases),
+             str(missing[:2]))
+
+    # The flag is read off the octets, not off the domain that built them.
+    # Cut the inserted region back out of the frame -- the engine says where
+    # it went and how long it is -- and walk one copy with this file's own
+    # walker. A flag that disagreed here would be a flag asserted rather than
+    # measured, which is the failure this item is about.
+    disagree, checked = [], 0
+    for (ret, data), m in cases:
+        grown, copies = m["len"] - m["was"], m.get("copies", 1)
+        if grown <= 0 or copies <= 0 or grown % copies:
+            continue
+        one = data[m["at"]:m["at"] + grown // copies]
+        mine = walk(one) is not None and len(one) > 0
+        checked += 1
+        if mine != bool(m["walks"]):
+            disagree.append((m.get("dom"), m.get("eid"), m.get("declared"),
+                             m["walks"], mine))
+    check.ok(checked and not disagree,
+             "and the flag agrees with an independent walk of the octets it "
+             "emitted, case by case (%d)" % checked,
+             str(disagree[:4]))
+
+    walking = {bool(m["walks"]) for _, m in cases}
+    check.ok(walking == {True, False},
+             "both answers occur, so neither is a constant (%s)"
+             % sorted(walking))
+
+    # The invariant itself.
+    absorbed = [(m.get("dom"), m.get("eid"), m.get("declared"), m["pos"],
+                 m["npos"]) for _, m in cases if not m["walks"] and
+                not m["tail"]]
+    check.ok(not absorbed,
+             "no case that stops the walk sits anywhere but last, where the "
+             "overrun leaves the buffer instead of being absorbed",
+             str(absorbed[:4]))
+
+    want_pre = len(walk(FRAME[CHAIN_OFF:]) or [])
+    wrong_pre = [m.get("pre") for _, m in cases if m["pre"] != want_pre]
+    check.ok(want_pre == NELEM and not wrong_pre,
+             "the chain this frame started with is %d elements deep, and "
+             "every case says so" % want_pre,
+             str(sorted(set(wrong_pre))[:4]))
+
+    lost = [(m.get("dom"), m.get("eid"), m["pre"], m["post"])
+            for _, m in cases if m["post"] < m["pre"]]
+    check.ok(not lost,
+             "and no case leaves a walker able to read fewer elements than "
+             "the frame had before it -- which is what an item that lies in "
+             "the middle of a chain costs",
+             str(lost[:4]))
+
+    # The honest domains keep their position axis; that is the other half of
+    # the rule and the half a blunt "put everything last" would destroy.
+    honest_pos = {m["pos"] for _, m in cases if m["walks"]}
+    check.ok(honest_pos == set(range(NELEM + 1)),
+             "every insertion point is still used by the cases that do walk "
+             "(%s)" % sorted(honest_pos))
+
+    first = [(m, m["post"] - m["pre"]) for _, m in cases
+             if m["walks"] and m["pos"] == 0 and m.get("dom") == "elem"]
+    check.ok(first and all(d == m.get("copies", 1) for m, d in first),
+             "an honest element at index 0 of the chain really has tested "
+             "%d elements and %s more, not one (%d case(s))"
+             % (NELEM, "one", len(first)),
+             str([(m.get("eid"), d) for m, d in first[:4]]))
+
+    liars = [m for _, m in cases if not m["walks"]]
+    check.ok(liars and all(m["at"] == m["was"] for m in liars),
+             "and every item that lies went in at the end of the frame, not "
+             "merely at the last insertion point of a chain (%d)"
+             % len(liars),
+             str([(m.get("dom"), m["at"], m["was"]) for m in liars[:4]]))
+
+
+def check_copies_fit(check, binary):
+    """A case the sizing admitted that the headroom will not hold.
+
+    The multiplicity domain is 2..5 copies whatever the room, and the insert
+    refuses rather than clipping -- so on a frame with little headroom the
+    frame went out unmutated while the ledger still counted the id as sent at
+    multiplicity 5. Same family as the rest of W10: the run reports a case it
+    did not send.
+    """
+    print("\nMultiplicity against the headroom it actually has")
+    # The least headroom the element domains will run in at all, so the
+    # clamp is reached inside a run rather than at a copy count no sweep
+    # gets to. Picked from the engine's own floor rather than guessed:
+    # anything smaller and there are no element cases to check.
+    narrow = len(FRAME) + ELEM_OVERHEAD
+    frames, msgs = run(binary, "t-w10-fit", 6000, capacity=narrow)
+    mult = [(f, m) for f, m in pair(frames, msgs)
+            if m is not None and m.get("type") == "MUT_ELEM" and
+            m.get("dom") == "mult"]
+    check.ok(mult, "multiplicity cases ran against %d octets of headroom (%d)"
+             % (narrow - len(FRAME), len(mult)))
+
+    idle = [(m.get("eid"), m.get("shape"), m.get("copies"))
+            for _, m in mult if m["len"] == m["was"]]
+    check.ok(not idle,
+             "none of them left the frame as built while reporting copies it "
+             "never inserted",
+             str(idle[:4]))
+
+    clamped = [m for _, m in mult if m.get("copies_req") is not None]
+    check.ok(clamped,
+             "the ones the headroom could not hold are clamped and say so "
+             "(%d of %d)" % (len(clamped), len(mult)))
+    check.ok(all(m["copies"] < m["copies_req"] for m in clamped),
+             "a clamped case reports fewer copies than it asked for",
+             str([(m.get("shape"), m["copies"], m["copies_req"])
+                  for m in clamped[:4]]))
+    bad = [(m.get("shape"), m["copies"], m["len"] - m["was"])
+           for _, m in mult
+           if (m["len"] - m["was"]) % m["copies"] or
+           m["len"] - m["was"] > narrow - m["was"]]
+    check.ok(not bad,
+             "and the octets that went in really are that many whole copies, "
+             "inside the headroom",
+             str(bad[:4]))
+
+    room = {m.get("shape") for _, m in mult if m.get("copies_req") is None}
+    check.ok(room,
+             "while a shape small enough to hold the copies it asked for is "
+             "not clamped (%s)" % sorted(x for x in room if x))
+
+
+MINIMA = []
+
+
+def load_minima(root):
+    """The generated minima table, as the engine gets it: from the tree."""
+    sys.path.insert(0, os.path.join(root, "fuzzing", "ledger"))
+    import minima
+    MINIMA[:] = minima.extract(root)
+    return minima
+
+
+def check_minima_fresh(root, check):
+    """W11. The minimums are generated, and the build fails when one moves."""
+    print("\nThe parser's own minimums, generated")
+    rc = subprocess.run([sys.executable,
+                         os.path.join(root, "fuzzing", "ledger", "minima.py"),
+                         root, "--check"], capture_output=True, text=True)
+    check.ok(rc.returncode == 0,
+             "minima.py --check agrees with the tree",
+             (rc.stdout + rc.stderr).strip()[:400])
+
+    minima = load_minima(root)
+    check.ok(MINIMA, "the parser states %d length guard(s)" % len(MINIMA))
+
+    # Every number came out of the compiler, against the tree's own headers.
+    # A row whose expression is not a plain integer is the interesting case:
+    # it is the one a re-implementation here would get wrong.
+    derived = [r for r in MINIMA if not r[4].strip().isdigit()]
+    check.ok(len(derived) >= 10,
+             "%d of them are sizeof() or a named constant rather than a "
+             "literal, so the value cannot be read off the source text"
+             % len(derived))
+    check.ok(all(r[5] > 0 for r in derived),
+             "and every one of those evaluated to a real length",
+             str([(r[4], r[5]) for r in derived if r[5] <= 0][:4]))
+
+    nptr, nlen, npair = minima.pairs(root)
+    check.ok((nptr, nlen) == (92, 78),
+             "struct ieee802_11_elems holds %d pointers and %d lengths, "
+             "which is the denominator this item is against" % (nptr, nlen))
+
+    # The extension parser's guard is against a length that has already lost
+    # the extension id. Getting that wrong aims the whole extension registry
+    # one octet low, and every window would miss by one in the same
+    # direction -- which is the shape of mistake a sweep never reports.
+    ext = [r for r in MINIMA if r[0] == "element id extension"]
+    check.ok(ext and all(r[6] == 1 for r in ext),
+             "every extension guard is one octet past the declared length, "
+             "read from the parser's own decrement (%d row(s))" % len(ext))
+    basic = [r for r in MINIMA if r[0] == "element id"]
+    check.ok(basic and all(r[6] == 0 for r in basic),
+             "and no basic element's is (%d row(s))" % len(basic))
+
+
+# The window's offsets, in the order the engine takes them. The membership
+# is the plan's; the order is a design choice, and it is the order that
+# decides what a short run reaches -- so it is checked as well as used.
+MIN_LADDER = [0, 1, 2, 3, 4, -1, -2, 7, 8, 0]
+EDGE_LADDER = [0, 1, 2, -1, 0, 1, -2, -1]
+
+
+def window_first(minimum, top, k):
+    """A permutation of 0..top that starts at the window around 'minimum'."""
+    window = []
+    for off in MIN_LADDER:
+        v = minimum + off
+        if 0 <= v <= top and v not in window:
+            window.append(v)
+    rest = [v for v in range(top + 1) if v not in window]
+    seq = window + rest
+    return seq[k] if k < len(seq) else None
+
+
+def ladder_value(domain, built, minimum, n, full):
+    """This file's own reading of the engine's ordering.
+
+    Written from the plan rather than from fuzz.c, because a check that
+    called the engine's arithmetic would agree with it however wrong both
+    were. A domain small enough to enumerate is permuted to start at the
+    window; a domain that is sampled gets ten ladder entries aimed at the
+    parser's minimum, then the eight that sit at the edges of the domain and
+    of where the frame already was.
+    """
+    mask = domain - 1
+    if full:
+        return window_first(minimum, mask, n)
+    if n < len(MIN_LADDER):
+        return (minimum + MIN_LADDER[n]) & mask
+    n -= len(MIN_LADDER)
+    if n < len(EDGE_LADDER):
+        d = EDGE_LADDER[n]
+        if n < 3:
+            return d & mask
+        if n < 6:
+            return (built + d) & mask
+        return (domain + d) & mask
+    return None                                # the stride, not the ladder
+
+
+def ident(m):
+    """(registry, member) for an element case."""
+    if m.get("reg") == "element id":
+        return ("element id", m.get("eid"))
+    return (m.get("reg"), m.get("ext_id", m.get("extlen_id")))
+
+
+def check_aims_at_the_minimum(check, binary):
+    """W11. The window above each enforced minimum is reached in run 1."""
+    print("\nEvery sampled length domain aims at the minimum")
+    want = {}
+    for registry, value, label, rel, expr, n, past in MINIMA:
+        want[(registry, value)] = (n + past, rel, expr)
+
+    _, msgs = run(binary, "t-w11", 9000)
+    e = [m for m in elems(msgs) if m.get("dom") in ("elem", "elen")]
+    check.ok(e, "element length cases ran (%d)" % len(e))
+
+    missing = [m for m in e if m.get("min") is None or
+               m.get("min_known") is None]
+    check.ok(not missing,
+             "every one of them reports the minimum it was aimed at",
+             str(missing[:2]))
+
+    known = {bool(m["min_known"]) for m in e}
+    check.ok(known == {True, False},
+             "both a known minimum and none occur, so the flag is not a "
+             "constant (%s)" % sorted(known))
+
+    # The engine's number against the generator's, row by row. A lookup that
+    # returned a constant, or that read the wrong registry, passes every
+    # other check in this file.
+    wrong = []
+    for m in e:
+        key = ident(m)
+        row = want.get(key)
+        if row is None:
+            if m["min_known"]:
+                wrong.append(("claimed a minimum", key, m.get("min")))
+        elif not m["min_known"] or m["min"] != row[0] or \
+                m.get("min_rel") != row[1] or m.get("min_expr") != row[2]:
+            wrong.append((key, m.get("min"), m.get("min_expr"), row))
+    check.ok(not wrong,
+             "and it is the generator's number and the guard's own words, "
+             "id by id (%d case(s) cross-checked)" % len(e),
+             str(wrong[:4]))
+
+    # The window itself, in the domain that samples: the k'th case an id
+    # gets must be the k'th entry of the ladder this file computes for it.
+    # Checking the k'th rather than the set is what makes a short run
+    # enough -- and a run is always short.
+    elen = [m for m in e if m["dom"] == "elen"]
+    by_id, out_of_order = {}, []
+    for m in elen:
+        seq = by_id.setdefault(ident(m), [])
+        sh = SHAPE_BY_ID.get(m["eid"], {"len_width": 1, "covers": False,
+                                        "ext_width": 0})
+        domain = 1 << (8 * sh["len_width"])
+        built = sh["ext_width"] if sh["covers"] else 0
+        want_v = ladder_value(domain, built, m["min"], len(seq),
+                              m.get("tier") == "FULL")
+        if want_v is not None and m["declared"] != want_v:
+            out_of_order.append((ident(m), len(seq), m["declared"], want_v))
+        seq.append(m["declared"])
+    check.ok(by_id and not out_of_order,
+             "the declared-length domain's k'th case for an id is the k'th "
+             "entry of the ladder, aimed at that id's own minimum "
+             "(%d id(s))" % len(by_id),
+             str(out_of_order[:4]))
+
+    check.ok(MIN_LADDER[0] == 0 and sorted(MIN_LADDER) ==
+             [-2, -1, 0, 0, 1, 2, 3, 4, 7, 8],
+             "the window's first entry is the minimum ITSELF, not the "
+             "bottom of the window: identity varies fastest, so an id a "
+             "short run touches once is built at that entry and no other")
+
+    # The figure this item exists to move: ids built at or above the length
+    # their own parser insists on. Below it the handler never runs, so the
+    # case is a registry member sent and a parser not reached.
+    at_or_above = {ident(m) for m in e
+                   if m["min_known"] and m["declared"] >= m["min"]}
+    aimed_ids = {ident(m) for m in e if m["min_known"]}
+    check.ok(aimed_ids and at_or_above == aimed_ids,
+             "every id with a guard was built AT or above it in this run "
+             "(%d of %d)" % (len(at_or_above), len(aimed_ids)),
+             str(sorted(aimed_ids - at_or_above)[:6]))
+
+    aimed = [m for m in elen if m["min_known"]]
+    below = sum(1 for m in aimed if m["declared"] < m["min"])
+    check.ok(below,
+             "the guard is tested from below as well as above (%d case(s))"
+             % below)
+
+    # The element domain enumerates rather than samples, so the window is a
+    # reordering there. Its first case for an id must be in the window.
+    first = {}
+    for m in e:
+        if m["dom"] != "elem" or not m["min_known"]:
+            continue
+        first.setdefault(ident(m), m)
+    off = [(k, m["declared"], m["min"]) for k, m in first.items()
+           if abs(m["declared"] - m["min"]) > 2]
+    check.ok(first and not off,
+             "the element domain's FIRST case for an id with a minimum is "
+             "within two octets of it, not at zero (%d id(s))" % len(first),
+             str(off[:4]))
+
+
+def check_fixed_ladder(check, binary):
+    """W11. A fixed count even when entries coincide."""
+    print("\nThe ladder is the same size whether or not there is a minimum")
+    _, msgs = run(binary, "t-w11-ladder", 9000,
+                  env={"FUZZ_TIER": "LADDER"})
+    elen = [m for m in elems(msgs) if m.get("dom") == "elen"]
+    check.ok(elen, "declared-length cases ran at LADDER (%d)" % len(elen))
+    check.ok(all(m.get("tier") == "LADDER" for m in elen),
+             "and say so")
+
+    seen = {}
+    for m in elen:
+        seen.setdefault(ident(m), []).append(m)
+    done = {k: v for k, v in seen.items() if len(v) >= 18}
+    check.ok(done,
+             "at least one id was taken through a whole ladder (%d of %d)"
+             % (len(done), len(seen)))
+    sizes = {len(v) for v in seen.values() if len(v) < 18}
+    check.ok(all(len(v) == 18 for v in done.values()),
+             "and a whole ladder is 18 cases: %d edges plus %d aimed at the "
+             "minimum" % (8, 10),
+             str(sorted({len(v) for v in done.values()})))
+
+    # The count does not move with whether a minimum is known -- which is the
+    # property that lets the generated table gain a row without shifting
+    # every case_id after it.
+    withmin = [k for k, v in done.items() if v[0]["min_known"]]
+    without = [k for k, v in done.items() if not v[0]["min_known"]]
+    check.ok(withmin and without,
+             "ids of both kinds completed one (%d with a minimum, %d "
+             "without)" % (len(withmin), len(without)))
+    check.ok(len({len(done[k]) for k in withmin + without}) == 1,
+             "and both kinds cost exactly the same number of cases",
+             str({k: len(done[k]) for k in (withmin[:2] + without[:2])}))
+
+    # Coinciding entries stay entries. An id whose minimum is 1 has a window
+    # that runs off the bottom of the domain and folds onto its edges; the
+    # case count must not notice.
+    dupes = [k for k, v in done.items()
+             if len({m["declared"] for m in v}) < len(v)]
+    check.ok(dupes,
+             "some ladders have entries that coincide, and are still 18 "
+             "cases (%d id(s))" % len(dupes))
+
+
 def check_ledger(root, check, binary):
     print("\nEnd to end: what the ledger makes of it")
     sys.path.insert(0, os.path.join(root, "fuzzing", "ledger"))
     from ledger import Ledger
-    ids, ext = registries(root)
-    _, msgs = run(binary, "auth-sae", (len(ids) + len(ext)) * 6)
+    ids, ext, extlen = registries(root)
+    nids = len(ids) + len(ext) + len(extlen)
+    _, msgs = run(binary, "auth-sae", nids * 12)
     led = Ledger()
     led.feed({"msg": "inventory", "targets": ["auth-sae"], "stages": []})
     for m in msgs:
@@ -483,6 +1216,7 @@ def check_ledger(root, check, binary):
     # worth sending, not members reached.
     seen_ids = set(air.get("element id", [])) & set(ids)
     seen_ext = set(air.get("element id extension", [])) & set(ext)
+    seen_xl = set(air.get("extended length element id", [])) & set(extlen)
     check.ok(seen_ids == set(ids),
              "the ledger reports %d of %d defined element ids on the air"
              % (len(seen_ids), len(ids)),
@@ -491,6 +1225,11 @@ def check_ledger(root, check, binary):
              "and %d of %d extension ids -- the measurement that started this "
              "work was 0 of 62" % (len(seen_ext), len(ext)),
              "missing: %s" % sorted(set(ext) - seen_ext)[:10])
+    check.ok(seen_xl == set(extlen),
+             "and %d of %d extended length ids, a registry that had no "
+             "denominator before there was a shape table"
+             % (len(seen_xl), len(extlen)),
+             "missing: %s" % sorted(set(extlen) - seen_xl)[:10])
     check.ok(len(air.get("element id", [])) > len(ids),
              "while the raw column stays wider than the registry (%d), which "
              "is the octet sweep reaching ids no member has"
@@ -502,7 +1241,10 @@ def check_ledger(root, check, binary):
 def main():
     root = os.path.abspath(sys.argv[1] if len(sys.argv) > 1 else ".")
     check = Check()
+    load_shape_table(root)
     check_registry_fresh(root, check)
+    check_headroom_floor(root, check)
+    check_minima_fresh(root, check)
     with tempfile.TemporaryDirectory() as tmp:
         binary = build(root, tmp)
         if not binary:
@@ -516,6 +1258,12 @@ def main():
         check_no_chain(check, binary)
         check_bounds(check, binary)
         check_unchanged(check, binary)
+        check_shapes(root, check, binary)
+        check_fragments_and_nesting(root, check, binary)
+        check_one_hostile_field(check, binary)
+        check_aims_at_the_minimum(check, binary)
+        check_fixed_ladder(check, binary)
+        check_copies_fit(check, binary)
         check_ledger(root, check, binary)
     print("\n%d of %d checks pass" % (check.passed,
                                       check.passed + check.failed))

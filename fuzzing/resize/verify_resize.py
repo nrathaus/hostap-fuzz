@@ -25,6 +25,7 @@ points over the same case space and comparing them case for case.
 
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -330,6 +331,29 @@ def check_disabled(binary, check):
     check.ok(not msgs, "and nothing is emitted")
 
 
+def engine_const(root, name):
+    """One of the engine's own reduction constants, read from fuzz.c.
+
+    These were written down here, and then W11 made the ladder ten cases
+    longer and this file said a correct sweep was the wrong size. A constant
+    copied into a check is a check that fails for the wrong reason the first
+    time the thing it checks is improved.
+    """
+    with open(os.path.join(root, "src", "common", "fuzz.c"),
+              encoding="utf-8") as f:
+        text = f.read()
+    m = re.search(r"#define\s+%s\s+(.+)" % re.escape(name), text)
+    if not m:
+        raise AssertionError("fuzz.c no longer defines %s" % name)
+    expr = m.group(1).split("/*")[0].strip()
+    if expr.isdigit():
+        return int(expr)
+    # A composite, such as (FUZZ_MIN_LADDER_N + FUZZ_EDGE_LADDER_N).
+    return eval(re.sub(r"[A-Z_][A-Z_0-9]*",
+                       lambda w: str(engine_const(root, w.group(0))),
+                       expr))
+
+
 def field_cases(root, frame, length):
     """What the field domains contribute to a frame of this kind and length.
 
@@ -340,15 +364,21 @@ def field_cases(root, frame, length):
     sys.path.insert(0, os.path.join(root, "fuzzing", "ledger"))
     import fields as fields_mod
 
+    full_max = engine_const(root, "FUZZ_TIER_FULL_MAX")
+    ladder = engine_const(root, "FUZZ_LADDER_N")
+    stride = engine_const(root, "FUZZ_STRIDE")
+    patterns = engine_const(root, "FUZZ_PATTERN_COUNT")
+
     total = 0
     for f_frame, _, _, off, width, kind, _ in fields_mod.build(root):
         if f_frame != frame or off + width > length:
             continue
         if kind == "opaque":
-            total += 6                      # FUZZ_PATTERN_COUNT
+            total += patterns
             continue
         domain = 1 << (8 * width)
-        total += domain if domain <= 256 else 8 + -(-domain // 251)
+        total += domain if domain <= full_max else \
+            ladder + -(-domain // stride)
     return total
 
 

@@ -36,9 +36,9 @@ int main(void)
 \tos_memset(frame, 0x41, sizeof(frame));
 
 \tapply_mutation_defer_log("eapol", FUZZ_TYPE_IEEE802_1X_HDR,
-\t\t\t\t frame, sizeof(frame));
+\t\t\t\t frame, sizeof(frame), sizeof(frame));
 \tapply_mutation_defer_log("eapol", FUZZ_TYPE_IEEE802_1X_HDR,
-\t\t\t\t frame, sizeof(frame));
+\t\t\t\t frame, sizeof(frame), sizeof(frame));
 \treturn 0;
 }
 """
